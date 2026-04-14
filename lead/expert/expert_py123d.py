@@ -7,45 +7,46 @@ This extends the Expert class to add Py123D Arrow format saving without modifyin
 import json
 import logging
 import os
+import time
+from tracemalloc import start
 import typing
 from collections import defaultdict
 from pathlib import Path
 
 import carla
 import numpy as np
+import shapely.geometry as geom
 from beartype import beartype
+from py123d.api.map.arrow.arrow_map_api import ArrowMapAPI, get_lru_cached_map_api
 from py123d.api.map.arrow.arrow_map_writer import ArrowMapWriter
 from py123d.api.scene.arrow.arrow_log_writer import ArrowLogWriter
 from py123d.api.scene.arrow.utils.log_writer_config import LogWriterConfig
-from py123d.datatypes.detections.box_detection_label import DefaultBoxDetectionLabel
-from py123d.datatypes.detections.box_detections import (
+from py123d.datatypes import (
     BoxDetectionAttributes,
     BoxDetectionSE3,
     BoxDetectionsSE3,
-)
-from py123d.datatypes.detections.box_detections_metadata import (
     BoxDetectionsSE3Metadata,
-)
-from py123d.datatypes.detections.traffic_light_detections import (
-    TrafficLightDetection,
-    TrafficLightDetections,
-)
-from py123d.datatypes.metadata.log_metadata import LogMetadata
-from py123d.datatypes.metadata.map_metadata import MapMetadata
-from py123d.datatypes.sensors.base_camera import Camera, CameraID
-from py123d.datatypes.sensors.lidar import Lidar, LidarFeature, LidarID, LidarMetadata
-from py123d.datatypes.sensors.pinhole_camera import (
+    Camera,
+    CameraID,
+    DefaultBoxDetectionLabel,
+    DynamicStateSE3,
+    EgoStateSE3,
+    Lidar,
+    LidarFeature,
+    LidarID,
+    LidarMetadata,
+    LogMetadata,
+    MapLayer,
+    MapMetadata,
     PinholeCameraMetadata,
     PinholeIntrinsics,
-)
-from py123d.datatypes.time.timestamp import Timestamp
-from py123d.datatypes.vehicle_state.dynamic_state import DynamicStateSE3
-from py123d.datatypes.vehicle_state.ego_state import EgoStateSE3
-from py123d.datatypes.vehicle_state.ego_state_metadata import (
-    get_carla_lincoln_mkz_2020_metadata,
+    Timestamp,
+    TrafficLightDetection,
+    TrafficLightDetections,
+    TrafficLightStatus,
 )
 from py123d.geometry import PoseSE3, Vector3D
-from py123d.geometry.transform.transform_se3 import rel_to_abs_se3
+from py123d.geometry.transform import rel_to_abs_se3
 from py123d.parser.base_dataset_parser import ModalitiesSync
 from py123d.parser.opendrive.opendrive_map_parser import iter_xodr_map_objects
 from py123d.script.utils.dataset_path_utils import get_dataset_paths
@@ -70,6 +71,12 @@ CAMERA_ID_MAPPING = {
     5: CameraID.PCAM_R1,
     6: CameraID.PCAM_B0,
 }
+
+# Max ego-to-waypoint distance (m) for logging a TL detection.
+TRAFFIC_LIGHT_LOG_RADIUS_M: float = 80.0
+
+# Max distance (m) from a TL waypoint to a 123D lane centerline for a match.
+LANE_CENTERLINE_MATCH_THRESHOLD_M: float = 0.1
 
 
 class ExpertPy123D(Expert):
@@ -138,7 +145,7 @@ class ExpertPy123D(Expert):
         )
 
         # Vehicle metadata (fixed for CARLA)
-        self._ego_metadata = get_carla_lincoln_mkz_2020_metadata()
+        self._ego_metadata = expert_py123d_utils.get_carla_lincoln_mkz_2020_metadata()
 
         # Box detections metadata
         self._box_detections_metadata = BoxDetectionsSE3Metadata(
@@ -227,6 +234,22 @@ class ExpertPy123D(Expert):
         self._py123d_map_writer.close()
         LOG.info("Map writer closed")
 
+        # Open a queryable map API for runtime lane lookups (traffic lights, etc.)
+        map_arrow_path = (
+            self._py123d_maps_root / "carla" / f"carla_{self._location}.arrow"
+        )
+        if map_arrow_path.exists():
+            self._py123d_map_api: ArrowMapAPI | None = get_lru_cached_map_api(
+                map_arrow_path
+            )
+            LOG.info(f"Loaded map API from: {map_arrow_path.absolute()}")
+        else:
+            self._py123d_map_api = None
+            LOG.warning(
+                f"Map Arrow file not found at {map_arrow_path.absolute()}. "
+                "Traffic-light lane lookups will be skipped."
+            )
+
     @beartype
     def _init_py123d_log(self) -> None:
         """Initialize Py123D log writer."""
@@ -240,7 +263,7 @@ class ExpertPy123D(Expert):
         # Create log metadata (sensor metadata is now per-modality, not in LogMetadata)
         log_metadata = LogMetadata(
             dataset=self.config_expert.py123d_dataset,
-            split=self.config_expert.py123d_split,
+            split=f"{self.config_expert.py123d_dataset}_{self.config_expert.py123d_split}",
             log_name=self._log_name,
             location=self._location,
             map_metadata=MapMetadata(
@@ -413,9 +436,8 @@ class ExpertPy123D(Expert):
             modalities.append(lidar)
 
         # Traffic light detections
-        # FIXME @DanielDauner: Temporarily disabling. Can fix it in the future.
-        # traffic_lights = self._extract_py123d_traffic_lights(ts)
-        # modalities.append(traffic_lights) 
+        traffic_lights = self._extract_py123d_traffic_lights(ts)
+        modalities.append(traffic_lights) 
 
         return ModalitiesSync(timestamp=ts, modalities=modalities)
 
@@ -655,8 +677,10 @@ class ExpertPy123D(Expert):
     ) -> TrafficLightDetections:
         """Extract traffic light detections from CARLA.
 
-        Uses close_traffic_lights populated by the parent expert class and
-        list_traffic_lights to resolve affected lane IDs.
+        For each CARLA TL, take its affected-lane waypoints, keep those within
+        ``TRAFFIC_LIGHT_LOG_RADIUS_M`` of the ego, query the 123D map, and emit
+        one detection per lane whose centerline runs within
+        ``LANE_CENTERLINE_MATCH_THRESHOLD_M`` of the waypoint.
 
         Args:
             timestamp: Current simulation timestamp.
@@ -664,27 +688,84 @@ class ExpertPy123D(Expert):
         Returns:
             TrafficLightDetections with per-lane status.
         """
-        detections: list[TrafficLightDetection] = []
+        if self._py123d_map_api is None:
+            LOG.info("Traffic-light map query skipped: no map API loaded.")
+            return TrafficLightDetections(detections=[], timestamp=timestamp)
 
-        # Build actor → waypoints lookup from list_traffic_lights
-        actor_waypoints: dict[int, list[carla.Waypoint]] = {
-            actor.id: waypoints
-            for actor, _center, waypoints in self.list_traffic_lights
-        }
+        ego_loc = self.ego_location
 
-        for _tl_actor, _bb, tl_state, tl_id, _affects_ego in self.close_traffic_lights:
-            status = expert_py123d_utils.carla_traffic_light_status_to_py123d(tl_state)
-            waypoints = actor_waypoints.get(tl_id, [])
-            if waypoints:
-                for wp in waypoints:
-                    detections.append(
-                        TrafficLightDetection(lane_id=wp.lane_id, status=status)
-                    )
-            else:
-                LOG.warning(
-                    f"Traffic light ID {tl_id} has no associated waypoints. Using negative actor ID as lane_id fallback."
+        # One query point per affected-lane waypoint (CARLA: +y right → 123D /
+        # ISO 8855: +y left, hence the y negation). Filter is per-waypoint so
+        # only lanes near the ego are logged, even at wide intersections.
+        query_points: list[geom.Point] = []
+        point_status: list[TrafficLightStatus] = []
+        lights_in_radius = 0
+        for actor in self.carla_world.get_actors().filter("*traffic_light*"):
+            if not isinstance(actor, carla.TrafficLight):
+                continue
+            waypoints = actor.get_affected_lane_waypoints()
+            for waypoint in waypoints:
+                lane_loc = waypoint.transform.location
+                if ego_loc.distance(lane_loc) > TRAFFIC_LIGHT_LOG_RADIUS_M:
+                    continue
+                lights_in_radius += 1
+                py123d_tf_status = expert_py123d_utils.carla_traffic_light_status_to_py123d(
+                    actor.state
                 )
+                query_points.append(geom.Point(lane_loc.x, -lane_loc.y))
+                point_status.append(py123d_tf_status)
 
+        if lights_in_radius == 0:
+            LOG.info(
+                f"Traffic-light map query skipped: no traffic lights within "
+                f"{TRAFFIC_LIGHT_LOG_RADIUS_M:.0f} m."
+            )
+            return TrafficLightDetections(detections=[], timestamp=timestamp)
+
+        # Single batched map call. `dwithin` (not `intersects`) absorbs sub-cm
+        # noise on polygon edges; same threshold reused as the centerline filter.
+        result = self._py123d_map_api.query_object_ids(
+            query_points,
+            [MapLayer.LANE],
+            predicate="dwithin",
+            distance=LANE_CENTERLINE_MATCH_THRESHOLD_M,
+        )
+
+        lane_dict = typing.cast(
+            dict[int, list[int]], result.get(MapLayer.LANE, {})
+        )
+
+        # Reject candidates whose centerline doesn't actually pass near the
+        # waypoint (the polygon query can grab adjacent/overlapping lanes).
+        # One status per lane: first match wins; conflicts are warned and dropped.
+        lane_status: dict[int, TrafficLightStatus] = {}
+        rejected = 0
+        for point_idx, lane_ids in lane_dict.items():
+            status = point_status[point_idx]
+            qp = query_points[point_idx]
+            for lane_id in lane_ids:
+                lane = self._py123d_map_api.get_map_object_in_layer(
+                    lane_id, MapLayer.LANE
+                )
+                if lane is None:
+                    rejected += 1
+                    continue
+                min_distance = lane.centerline.linestring.distance(qp)
+                if min_distance > LANE_CENTERLINE_MATCH_THRESHOLD_M:
+                    rejected += 1
+                    continue
+                existing = lane_status.get(lane_id)
+                if existing is None:
+                    lane_status[lane_id] = status
+                elif existing != status:
+                    LOG.warning(
+                        f"Conflicting traffic-light status for lane {lane_id}: "
+                        f"keeping {existing.name}, ignoring {status.name}."
+                    )
+        detections = [
+            TrafficLightDetection(lane_id=lane_id, status=status)
+            for lane_id, status in lane_status.items()
+        ]
         return TrafficLightDetections(detections=detections, timestamp=timestamp)
 
     @beartype
@@ -741,7 +822,7 @@ class ExpertPy123D(Expert):
             with open(
                 os.path.join(
                     self._py123d_logs_root.absolute(),
-                    self.config_expert.py123d_split,
+                    f"{self.config_expert.py123d_dataset}_{self.config_expert.py123d_split}",
                     self._log_name + ".json",
                 ),
                 "w",

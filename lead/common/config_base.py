@@ -225,60 +225,61 @@ class BaseConfig:
                 }
             }
         elif self.target_dataset == TargetDataset.CARLA_PY123D_6CAMERAS:
-            # NOTE: Use six cameras inspired by nuScenes rig.
+            # NOTE: Use six cameras inspired by nuScenes rig. In contract 
+            # to the nuScenes resolution 1600x900, we use a downsampled 800x450 resolution
             return {
                 # CAM_FRONT
                 1: {
                     "pos": [0.32, 0.0, 1.6],
                     "rot": [0.0, 0.0, 0.0],
-                    "width": 1600,
-                    "height": 900,
-                    "cropped_height": 900,
+                    "width": 800,
+                    "height": 450,
+                    "cropped_height": 450,
                     "fov": 65,
                 },
                 # CAM_FRONT_LEFT
                 2: {
                     "pos": [0.15, -0.49, 1.6],
                     "rot": [0.0, 0.0, -55.0],
-                    "width": 1600,
-                    "height": 900,
-                    "cropped_height": 900,
+                    "width": 800,
+                    "height": 450,
+                    "cropped_height": 450,
                     "fov": 65,
                 },
                 # CAM_BACK_LEFT
                 3: {
                     "pos": [-0.35, -0.48, 1.6],
                     "rot": [0.0, 0.0, -110.0],
-                    "width": 1600,
-                    "height": 900,
-                    "cropped_height": 900,
+                    "width": 800,
+                    "height": 450,
+                    "cropped_height": 450,
                     "fov": 65,
                 },
                 # CAM_FRONT_RIGHT
                 4: {
                     "pos": [0.15, 0.49, 1.6],
                     "rot": [0.0, 0.0, 55.0],
-                    "width": 1600,
-                    "height": 900,
-                    "cropped_height": 900,
+                    "width": 800,
+                    "height": 450,
+                    "cropped_height": 450,
                     "fov": 65,
                 },
                 # CAM_BACK_RIGHT
                 5: {
                     "pos": [-0.35, 0.48, 1.6],
                     "rot": [0.0, 0.0, 110.0],
-                    "width": 1600,
-                    "height": 900,
-                    "cropped_height": 900,
+                    "width": 800,
+                    "height": 450,
+                    "cropped_height": 450,
                     "fov": 65,
                 },
                 # CAM_BACK
                 6: {
                     "pos": [-1.36, 0.0, 1.6],
                     "rot": [0.0, 0.0, -180.0],
-                    "width": 1600,
-                    "height": 900,
-                    "cropped_height": 900,
+                    "width": 800,
+                    "height": 450,
+                    "cropped_height": 450,
                     "fov": 90,
                 },
             }
