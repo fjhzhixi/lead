@@ -29,6 +29,7 @@ from py123d.datatypes import (
     DefaultBoxDetectionLabel,
     DynamicStateSE3,
     EgoStateSE3,
+    Lane,
     Lidar,
     LidarFeature,
     LidarID,
@@ -48,6 +49,7 @@ from py123d.geometry.transform import rel_to_abs_se3
 from py123d.parser.base_dataset_parser import ModalitiesSync
 from py123d.parser.opendrive.opendrive_map_parser import iter_xodr_map_objects
 from py123d.script.utils.dataset_path_utils import get_dataset_paths
+from shapely.ops import substring
 
 from lead.common import constants
 from lead.common.logging_config import setup_logging
@@ -76,6 +78,12 @@ TRAFFIC_LIGHT_LOG_RADIUS_M: float = 80.0
 
 # Max distance (m) from a TL waypoint to a 123D lane centerline for a match.
 LANE_CENTERLINE_MATCH_THRESHOLD_M: float = 0.1
+
+# Length (m) of the lane centerline start segment used to match TL waypoints.
+LANE_START_MATCH_LENGTH_M: float = 5.0
+
+# Whether to only assign TL to lanes on intersections.
+FORCE_TL_ON_INTERSECTIONS: bool = True
 
 
 class ExpertPy123D(Expert):
@@ -424,8 +432,9 @@ class ExpertPy123D(Expert):
         # Convert LEAD's bounding boxes format to Py123D
         box_detections = self._extract_py123d_box_detections(input_data, ts)
         LOG.debug(f"Extracted {len(box_detections.box_detections)} bounding boxes")
-        if box_detections.box_detections:
-            modalities.append(box_detections)
+        modalities.append(
+            box_detections,
+        )  # NOTE: We also write the modality if no boxes are found.
 
         # Convert camera data (needs ego state for world-space extrinsic)
         cameras = self._extract_py123d_camera_data(input_data, ts, ego_state)
@@ -709,7 +718,8 @@ class ExpertPy123D(Expert):
         # only lanes near the ego are logged, even at wide intersections.
         query_points: list[geom.Point] = []
         point_status: list[TrafficLightStatus] = []
-        lights_in_radius = 0
+        point_actor_ids: list[int] = []
+        actor_ids_in_radius: set[int] = set()
         for actor in self.carla_world.get_actors().filter("*traffic_light*"):
             if not isinstance(actor, carla.TrafficLight):
                 continue
@@ -718,7 +728,7 @@ class ExpertPy123D(Expert):
                 lane_loc = waypoint.transform.location
                 if ego_loc.distance(lane_loc) > TRAFFIC_LIGHT_LOG_RADIUS_M:
                     continue
-                lights_in_radius += 1
+                actor_ids_in_radius.add(actor.id)
                 py123d_tf_status = (
                     expert_py123d_utils.carla_traffic_light_status_to_py123d(
                         actor.state,
@@ -726,8 +736,9 @@ class ExpertPy123D(Expert):
                 )
                 query_points.append(geom.Point(lane_loc.x, -lane_loc.y))
                 point_status.append(py123d_tf_status)
+                point_actor_ids.append(actor.id)
 
-        if lights_in_radius == 0:
+        if not actor_ids_in_radius:
             LOG.info(
                 f"Traffic-light map query skipped: no traffic lights within "
                 f"{TRAFFIC_LIGHT_LOG_RADIUS_M:.0f} m.",
@@ -749,22 +760,43 @@ class ExpertPy123D(Expert):
         # waypoint (the polygon query can grab adjacent/overlapping lanes).
         # One status per lane: first match wins; conflicts are warned and dropped.
         lane_status: dict[int, TrafficLightStatus] = {}
+        assigned_actor_ids: set[int] = set()
         rejected = 0
         for point_idx, lane_ids in lane_dict.items():
             status = point_status[point_idx]
             qp = query_points[point_idx]
+            actor_id = point_actor_ids[point_idx]
             for lane_id in lane_ids:
                 lane = self._py123d_map_api.get_map_object_in_layer(
                     lane_id,
                     MapLayer.LANE,
                 )
+                assert isinstance(lane, Lane)
                 if lane is None:
                     rejected += 1
                     continue
-                min_distance = lane.centerline.linestring.distance(qp)
-                if min_distance > LANE_CENTERLINE_MATCH_THRESHOLD_M:
+                if lane.lane_group is not None:
+                    lane_in_intersection = lane.lane_group.intersection_id is not None
+                else:
+                    lane_in_intersection = False
+
+                lane_in_intersection = (
+                    lane_in_intersection or not FORCE_TL_ON_INTERSECTIONS
+                )
+                centerline = lane.centerline.linestring
+                start_segment = substring(
+                    centerline,
+                    0.0,
+                    min(LANE_START_MATCH_LENGTH_M, centerline.length),
+                )
+                min_distance = start_segment.distance(qp)
+                if (
+                    min_distance > LANE_CENTERLINE_MATCH_THRESHOLD_M
+                    or not lane_in_intersection
+                ):
                     rejected += 1
                     continue
+                assigned_actor_ids.add(actor_id)
                 existing = lane_status.get(lane_id)
                 if existing is None:
                     lane_status[lane_id] = status
@@ -773,6 +805,15 @@ class ExpertPy123D(Expert):
                         f"Conflicting traffic-light status for lane {lane_id}: "
                         f"keeping {existing.name}, ignoring {status.name}.",
                     )
+        unassigned_actor_ids = actor_ids_in_radius - assigned_actor_ids
+        if unassigned_actor_ids:
+            LOG.warning(
+                f"Traffic-light assignment incomplete: "
+                f"{len(assigned_actor_ids)}/{len(actor_ids_in_radius)} assigned. "
+                f"assigned={sorted(assigned_actor_ids)}, "
+                f"unassigned={sorted(unassigned_actor_ids)}, "
+                f"rejected_candidates={rejected}.",
+            )
         detections = [
             TrafficLightDetection(lane_id=lane_id, status=status)
             for lane_id, status in lane_status.items()
