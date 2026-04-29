@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import lzma
+import pickle
 import random
 import time
 
@@ -819,9 +821,26 @@ class CARLAData(Dataset):
                     self.persistent_cache[used_cache_key] = cached_compressed_data
 
                 return cached_compressed_data.decompress()
-            except EOFError:
+            except (
+                EOFError,
+                lzma.LZMAError,
+                pickle.UnpicklingError,
+                ValueError,
+                OSError,
+            ) as e:
+                persistent_path = None
+                if self.persistent_cache is not None:
+                    persistent_path = used_cache_key.persistent_cache_full_path
                 LOG.warning(
                     f"EOFError when reading cache for key {used_cache_key}. Rebuilding cache for this key.",
+                    "Cache read failed for key "
+                    f"(scenario={used_cache_key.scenario}, "
+                    f"route={used_cache_key.route}, "
+                    f"frame={used_cache_key.frame}, "
+                    f"perturbated={used_cache_key.perturbated}). "
+                    f"Persistent path={persistent_path}. "
+                    f"Error={type(e).__name__}: {e}. "
+                    "Rebuilding cache for this key.",
                 )
 
         # Data not in cache, load from disk. Do this for all 3 views, since we might need them later.

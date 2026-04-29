@@ -179,7 +179,7 @@ class TrainingConfig(BaseConfig):
 
     # --- Training cache ---
     # If true use training session cache. This cache reduces data loading time.
-    use_training_session_cache = True
+    use_training_session_cache = False
     # If true use persistent cache for training. This cache reduces heavy feature building.
     use_persistent_cache = True
     # If true force rebuild the cache for each training run.

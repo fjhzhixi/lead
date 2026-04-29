@@ -72,6 +72,15 @@ class ColoredFormatter(logging.Formatter):
         return result
 
 
+def _resolve_logging_rank() -> int:
+    """Resolve distributed rank from environment for log-level selection."""
+    for env_name in ["RANK", "LOCAL_RANK"]:
+        env_value = os.environ.get(env_name)
+        if env_value is not None:
+            return int(env_value)
+    return 0
+
+
 @beartype
 def setup_logging(level: str = None, format_string: str = None):
     """
@@ -84,6 +93,8 @@ def setup_logging(level: str = None, format_string: str = None):
         format_string: Custom format string for log messages.
                       Defaults to a standard format with timestamp.
     """
+    rank = _resolve_logging_rank()
+
     # Determine log level
     if level is None:
         # Check environment variable first
@@ -136,13 +147,16 @@ def setup_logging(level: str = None, format_string: str = None):
     ]:
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
+    effective_level = level if rank == 0 else logging.WARNING
+
     # Set root logger to WARNING by default, so only lead.* modules show INFO
-    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.WARNING if rank == 0 else logging.WARNING)
 
     # Enable your lead modules at the specified level
-    logging.getLogger("lead").setLevel(level)
+    logging.getLogger("lead").setLevel(effective_level)
 
-    logger.info(
-        "Logging configured: level=%s for 'lead' modules",
-        logging.getLevelName(level),
-    )
+    if rank == 0:
+        logger.info(
+            "Logging configured: level=%s for 'lead' modules",
+            logging.getLevelName(effective_level),
+        )
