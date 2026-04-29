@@ -45,14 +45,14 @@ class TrainingConfig(BaseConfig):
             return TargetDataset.WAYMO_E2E_2025_3CAMERAS
         elif self.use_navsim_data:
             return TargetDataset.NAVSIM_4CAMERAS
+        elif "carla_leaderboard2_360" in self.carla_root:
+            return TargetDataset.CARLA_LEADERBOARD2_6CAMERAS
         elif "carla_leaderboard2" in self.carla_root:
             return TargetDataset.CARLA_LEADERBOARD2_3CAMERAS
         elif "carla_leaderboad2_v3" in self.carla_root:
             return TargetDataset.CARLA_LEADERBOARD2_3CAMERAS
         elif "carla_leaderboad2_v8" in self.carla_root:
             return TargetDataset.CARLA_LEADERBOARD2_3CAMERAS
-        elif "carla_leaderboad2_v10" in self.carla_root:
-            return TargetDataset.CARLA_LEADERBOARD2_6CAMERAS
         raise ValueError(
             f"Unknown CARLA root path: {self.carla_root}. Please register it in the config.",
         )
@@ -161,7 +161,7 @@ class TrainingConfig(BaseConfig):
     @overridable_property
     def visualize_training(self):
         """If true produce images during training for visualization."""
-        return True
+        return False
 
     # Unique experiment identifier.
     id = "Experiment 1"
@@ -212,7 +212,7 @@ class TrainingConfig(BaseConfig):
         return tmp_folder
 
     # Root directory for CARLA sensor data.
-    carla_root = "data/carla_leaderboard2"
+    carla_root = "/high_perf_store3/l3_data/fujiahui/LatentWM/dataset/lead_data/lead360/data/carla_leaderboard2_360"
 
     @property
     def carla_data(self):
@@ -982,41 +982,22 @@ class TrainingConfig(BaseConfig):
         """How often to log scalar values during training."""
         if self.debug_mode:
             return 1
-        try:
-            with open(
-                os.path.join(
-                    self.lead_project_root,
-                    "slurm/configs/wandb_log_frequency_training_scalar.txt",
-                ),
-            ) as f:
-                return int(f.readline().strip())
-        except Exception as e:
-            LOG.error(f"Error reading log frequency file: {e}.")
-            return 1
+        return 10
 
     @property
     def log_images_frequency(self):
         """How often to log images during training."""
         if self.debug_mode:
             return 100
-        try:
-            with open(
-                os.path.join(
-                    self.lead_project_root,
-                    "slurm/configs/wandb_log_frequency_training_images.txt",
-                ),
-            ) as f:
-                return int(f.readline().strip())
-        except Exception as e:
-            LOG.error(f"Error reading log frequency file: {e}.")
-            return 100
+        
+        return 10000
 
     @overridable_property
     def log_wandb(self):
         """If true log metrics to Weights & Biases."""
         if self.debug_mode:
             return False
-        return True
+        return False
 
     # --- Hardware configuration ---
     @property

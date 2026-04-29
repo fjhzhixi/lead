@@ -126,7 +126,7 @@ class Logger:
                 predictions=predictions,
                 data=data,
                 save_image=True,
-                save_path=os.path.join("outputs", "training_viz"),
+                save_path=os.path.join(self.config.logdir, "training_viz"),
                 postfix=str(self.step).zfill(5),
                 prefix="train",
             )

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from beartype import beartype
 from torch import nn
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 from lead.tfv6 import transfuser_utils as fn
 from lead.training.config_training import TrainingConfig
@@ -35,6 +36,9 @@ class TransfuserBackbone(nn.Module):
             config.image_architecture,
             pretrained=True,
             features_only=True,
+            pretrained_cfg_overlay={
+                "file": "/high_perf_store3/l3_data/fujiahui/LatentWM/workdir/carl_carla_workspace/models/resnet34.a1_in1k/model.safetensors",
+            },
         )
         self.avgpool_img = nn.AdaptiveAvgPool2d(
             (self.config.img_vert_anchors, self.config.img_horz_anchors),
@@ -592,14 +596,15 @@ class SelfAttention(nn.Module):
         )  # (b, nh, t, hs)
 
         # self-attend: (b, nh, t, hs) x (b, nh, hs, t) -> (b, nh, t, t)
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            dropout_p=self.dropout if self.training else 0,
-            is_causal=False,
-        )
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=False,
+            )
         y = (
             y.transpose(1, 2).contiguous().view(b, t, c)
         )  # re-assemble all head outputs side by side

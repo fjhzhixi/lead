@@ -360,4 +360,8 @@ def main():
 
 if __name__ == "__main__":
     training_utils.set_start_method()
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
     main()
