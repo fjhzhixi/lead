@@ -184,6 +184,16 @@ class TrainingConfig(BaseConfig):
     use_persistent_cache = True
     # If true force rebuild the cache for each training run.
     force_rebuild_data_cache = False
+    # Optional list of cache keys to restrict cache building.
+    # Keys follow CacheKey.__str__ format, e.g. scenario_route_frame_False)
+    cache_key_filter_list: list[str] | None = None
+
+    @property
+    def cache_key_filter_set(self) -> frozenset[str] | None:
+        """Normalized cache key filter for O(1) lookup during data loading."""
+        if not self.cache_key_filter_list:
+            return None
+        return frozenset(self.cache_key_filter_list)
 
     @property
     def carla_cache_path(self):

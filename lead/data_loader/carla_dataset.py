@@ -93,6 +93,28 @@ class CARLAData(Dataset):
             LOG.info(f"All frames: {self.bucket_collection.all_frames}")
             LOG.info(f"Trainable frames: {self.bucket_collection.trainable_frames}")
 
+    def _build_cache_key_string(self, image_path_str: str, perturbated: bool) -> str:
+        """Build cache key string from image path using CacheKey string semantics."""
+        route = image_path_str.split("/")[-3]
+        scenario = image_path_str.split("/")[-4]
+        frame = image_path_str.split("/")[-1].split(".")[0]
+        return str(
+            CacheKey(
+                scenario=scenario,
+                route=route,
+                frame=frame,
+                perturbated=perturbated,
+                config=self.config,
+            ),
+        )
+
+    def _is_cache_key_allowed(self, cache_key: CacheKey) -> bool:
+        """Return whether a cache key is allowed by key filter configuration."""
+        key_filter_set = self.config.cache_key_filter_set
+        if key_filter_set is None:
+            return True
+        return str(cache_key) in key_filter_set
+
     def __getitem__(self, index):
         # ----------------------------------------------------------------------------------------
         # First part of the dataloader: lightweight meta data
@@ -803,18 +825,29 @@ class CARLAData(Dataset):
                 )
 
         # Data not in cache, load from disk. Do this for all 3 views, since we might need them later.
-        sensor_data_normal = self._load_sensor_data_and_build_cache(
-            data=data,
-            meta=meta,
-            index=index,
-            perturbated=False,
-            perturbation_translation=0.0,
-            perturbation_rotation=0.0,
-            cache_key=cache_key_normal,
-        )
+        should_build_normal = True
+        should_build_perturbated = self.config.use_sensor_perburtation
+        if self.build_cache and self.config.cache_key_filter_set is not None:
+            should_build_normal = self._is_cache_key_allowed(cache_key_normal)
+            should_build_perturbated = (
+                self.config.use_sensor_perburtation
+                and self._is_cache_key_allowed(cache_key_perturbated)
+            )
+
+        sensor_data_normal = None
+        if should_build_normal:
+            sensor_data_normal = self._load_sensor_data_and_build_cache(
+                data=data,
+                meta=meta,
+                index=index,
+                perturbated=False,
+                perturbation_translation=0.0,
+                perturbation_rotation=0.0,
+                cache_key=cache_key_normal,
+            )
 
         sensor_data_perturbated = None
-        if self.config.use_sensor_perburtation:
+        if should_build_perturbated:
             sensor_data_perturbated = self._load_sensor_data_and_build_cache(
                 data=data,
                 meta=meta,
@@ -828,8 +861,12 @@ class CARLAData(Dataset):
         # This part is needed to handle special case: bev_3rd_person_image always uses unaugmented version
         if perturbate_sensor and sensor_data_perturbated is not None:
             selected_data = sensor_data_perturbated
-        else:
+        elif sensor_data_normal is not None:
             selected_data = sensor_data_normal
+        elif sensor_data_perturbated is not None:
+            selected_data = sensor_data_perturbated
+        else:
+            raise RuntimeError("No sensor data was loaded for the selected cache filters.")
         return SensorData(
             image=selected_data.image,
             rasterized_lidar=selected_data.rasterized_lidar,
@@ -840,7 +877,7 @@ class CARLAData(Dataset):
             boxes_waypoints=selected_data.boxes_waypoints,
             boxes_num_waypoints=selected_data.boxes_num_waypoints,
             bev_occupancy=selected_data.bev_occupancy,
-            bev_3rd_person_image=sensor_data_normal.bev_3rd_person_image,
+            bev_3rd_person_image=selected_data.bev_3rd_person_image,
             radars=selected_data.radars,
             radar_detections=selected_data.radar_detections,
         )
@@ -1025,10 +1062,14 @@ class CARLAData(Dataset):
             )
 
             # Store CompressedSensorData object directly in cache
-            if self.training_session_cache is not None:
+            if self.training_session_cache is not None and self._is_cache_key_allowed(
+                cache_key,
+            ):
                 self.training_session_cache[cache_key] = compressed_sensor_data
 
-            if self.persistent_cache is not None:
+            if self.persistent_cache is not None and self._is_cache_key_allowed(
+                cache_key,
+            ):
                 self.persistent_cache[cache_key] = compressed_sensor_data
 
         return sensor_data
@@ -1134,6 +1175,69 @@ class CARLAData(Dataset):
         self.sample_start = np.array(self.sample_start)
         self.bucket_identity = np.array(self.bucket_identity)
         self.global_indices = np.array(self.global_indices)
+
+        key_filter_set = self.config.cache_key_filter_set
+        if key_filter_set is not None:
+            selected_mask = np.zeros(len(self.images), dtype=bool)
+            matched_keys = set()
+
+            for idx, image_path in enumerate(self.images):
+                image_path_str = str(image_path, encoding="utf-8")
+                normal_key = self._build_cache_key_string(
+                    image_path_str=image_path_str,
+                    perturbated=False,
+                )
+                perturbated_key = self._build_cache_key_string(
+                    image_path_str=image_path_str,
+                    perturbated=True,
+                )
+                if normal_key in key_filter_set or perturbated_key in key_filter_set:
+                    selected_mask[idx] = True
+                    if normal_key in key_filter_set:
+                        matched_keys.add(normal_key)
+                    if perturbated_key in key_filter_set:
+                        matched_keys.add(perturbated_key)
+
+            selected_count = int(selected_mask.sum())
+            requested_count = len(key_filter_set)
+            missing_keys = sorted(key_filter_set - matched_keys)
+
+            for attr_name in [
+                "bev_3rd_person_images",
+                "images",
+                "images_perturbated",
+                "semantics",
+                "semantics_perturbated",
+                "bev_semantics",
+                "bev_semantics_perturbated",
+                "depth",
+                "depth_perturbated",
+                "lidars",
+                "radars",
+                "radars_perturbated",
+                "bboxes",
+                "metas",
+                "route_dirs",
+                "route_indices",
+                "sample_start",
+                "bucket_identity",
+                "global_indices",
+            ]:
+                setattr(self, attr_name, getattr(self, attr_name)[selected_mask])
+
+            if self.rank == 0:
+                LOG.info(
+                    "Applied cache_key_filter_list: requested=%d matched=%d selected_samples=%d",
+                    requested_count,
+                    len(matched_keys),
+                    selected_count,
+                )
+                if missing_keys:
+                    LOG.info(
+                        "cache_key_filter_list missing keys count=%d examples=%s",
+                        len(missing_keys),
+                        missing_keys[:5],
+                    )
 
         if self.random:
             # Shuffle all arrays together
