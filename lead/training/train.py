@@ -18,7 +18,7 @@ from lead.training.logger import Logger
 matplotlib.use("Agg")  # non-GUI backend for headless servers
 
 setup_logging()
-LOG = logging.getLogger(__name__)
+LOG = logging.getLogger("lead.training.train")
 
 warnings.filterwarnings("error")
 warnings.filterwarnings(

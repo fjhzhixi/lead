@@ -150,13 +150,14 @@ def setup_logging(level: str = None, format_string: str = None):
     effective_level = level if rank == 0 else logging.WARNING
 
     # Set root logger to WARNING by default, so only lead.* modules show INFO
-    logging.getLogger().setLevel(logging.WARNING if rank == 0 else logging.WARNING)
+    logging.getLogger().setLevel(logging.WARNING)
 
     # Enable your lead modules at the specified level
-    logging.getLogger("lead").setLevel(effective_level)
+    lead_logger = logging.getLogger("lead")
+    lead_logger.setLevel(effective_level)
 
     if rank == 0:
-        logger.info(
+        lead_logger.info(
             "Logging configured: level=%s for 'lead' modules",
             logging.getLevelName(effective_level),
         )
