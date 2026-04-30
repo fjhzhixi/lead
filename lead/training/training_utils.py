@@ -131,9 +131,9 @@ def initialize_model(
         )
 
     model.backbone.requires_grad_(not config.freeze_backbone)
-    LOG.info(
-        f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad):,} trainable parameters",
-    )
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    params_m = total_params / 1e6
+    LOG.info(f"Model has {params_m:.2f}M trainable parameters")
     if config.channel_last:
         model = model.to(memory_format=torch.channels_last)
         LOG.info("Using channel last memory format")

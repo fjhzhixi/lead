@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import lzma
+import multiprocessing
 import pickle
 import random
 import time
@@ -67,6 +68,13 @@ class CARLAData(Dataset):
             PersistentCache(self.config) if self.config.use_persistent_cache else None
         )
         self.memory_cache = {}
+        self.sensor_memory_cache = {} if self.config.use_memory_cache else None
+        self.sensor_memory_cache_bytes = 0
+        self.sensor_memory_cache_hits = 0
+        self.sensor_memory_cache_misses = 0
+        self.sensor_memory_cache_inserts = 0
+        self.sensor_memory_cache_skipped = 0
+        self.current_epoch_shared = multiprocessing.Value("i", 0)
         self.semantic_converter = np.uint8(
             list(constants.SEMANTIC_SEGMENTATION_CONVERTER.values()),
         )
@@ -116,6 +124,70 @@ class CARLAData(Dataset):
         if key_filter_set is None:
             return True
         return str(cache_key) in key_filter_set
+
+    def set_current_epoch(self, epoch: int) -> None:
+        """Set current epoch for memory cache fill policy shared with workers."""
+        with self.current_epoch_shared.get_lock():
+            self.current_epoch_shared.value = epoch
+
+    def _current_epoch(self) -> int:
+        """Read current epoch from shared state."""
+        return int(self.current_epoch_shared.value)
+
+    def _should_fill_memory_cache(self) -> bool:
+        """Only fill RAM cache during first epoch."""
+        return self._current_epoch() == 0
+
+    def _estimate_sensor_data_bytes(self, sensor_data: SensorData) -> int:
+        """Estimate SensorData memory footprint for optional cache cap."""
+        size = 0
+        for value in [
+            sensor_data.image,
+            sensor_data.rasterized_lidar,
+            sensor_data.semantic,
+            sensor_data.hdmap,
+            sensor_data.depth,
+            sensor_data.boxes,
+            sensor_data.boxes_waypoints,
+            sensor_data.boxes_num_waypoints,
+            sensor_data.bev_occupancy,
+            sensor_data.bev_3rd_person_image,
+            sensor_data.radar_detections,
+        ]:
+            if value is not None:
+                size += int(value.nbytes)
+
+        if sensor_data.radars is not None:
+            for radar in sensor_data.radars:
+                size += int(radar.nbytes)
+
+        return size
+
+    def _maybe_insert_sensor_memory_cache(
+        self,
+        cache_key: CacheKey,
+        sensor_data: SensorData,
+    ) -> None:
+        """Insert SensorData into RAM cache if enabled and in fill phase."""
+        if self.sensor_memory_cache is None:
+            return
+        if not self._should_fill_memory_cache():
+            return
+        if cache_key in self.sensor_memory_cache:
+            return
+
+        size_bytes = self._estimate_sensor_data_bytes(sensor_data)
+        max_bytes = self.config.memory_cache_max_bytes
+        if (
+            max_bytes is not None
+            and self.sensor_memory_cache_bytes + size_bytes > max_bytes
+        ):
+            self.sensor_memory_cache_skipped += 1
+            return
+
+        self.sensor_memory_cache[cache_key] = sensor_data
+        self.sensor_memory_cache_bytes += size_bytes
+        self.sensor_memory_cache_inserts += 1
 
     def __getitem__(self, index):
         # ----------------------------------------------------------------------------------------
@@ -780,6 +852,15 @@ class CARLAData(Dataset):
         else:
             used_cache_key = cache_key_normal
 
+        if (
+            self.sensor_memory_cache is not None
+            and used_cache_key in self.sensor_memory_cache
+        ):
+            self.sensor_memory_cache_hits += 1
+            return self.sensor_memory_cache[used_cache_key]
+        if self.sensor_memory_cache is not None:
+            self.sensor_memory_cache_misses += 1
+
         # Data in cache. Load them from cache
         if (
             (
@@ -820,7 +901,9 @@ class CARLAData(Dataset):
                 ):
                     self.persistent_cache[used_cache_key] = cached_compressed_data
 
-                return cached_compressed_data.decompress()
+                sensor_data = cached_compressed_data.decompress()
+                self._maybe_insert_sensor_memory_cache(used_cache_key, sensor_data)
+                return sensor_data
             except (
                 EOFError,
                 lzma.LZMAError,
@@ -864,6 +947,7 @@ class CARLAData(Dataset):
                 perturbation_rotation=0.0,
                 cache_key=cache_key_normal,
             )
+            self._maybe_insert_sensor_memory_cache(cache_key_normal, sensor_data_normal)
 
         sensor_data_perturbated = None
         if should_build_perturbated:
@@ -875,6 +959,10 @@ class CARLAData(Dataset):
                 perturbation_translation=meta["perturbation_translation"],
                 perturbation_rotation=meta["perturbation_rotation"],
                 cache_key=cache_key_perturbated,
+            )
+            self._maybe_insert_sensor_memory_cache(
+                cache_key_perturbated,
+                sensor_data_perturbated,
             )
 
         # This part is needed to handle special case: bev_3rd_person_image always uses unaugmented version

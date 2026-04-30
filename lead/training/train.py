@@ -133,7 +133,16 @@ class Trainer:
 
     def train_loop(self):
         for epoch in range(self.cur_epoch, self.config.epochs):
-            self.dataloader.dataset.shuffle(epoch)
+            set_current_epoch = getattr(
+                self.dataloader.dataset,
+                "set_current_epoch",
+                None,
+            )
+            if callable(set_current_epoch):
+                set_current_epoch(epoch)
+
+            dataset_shuffle = getattr(self.dataloader.dataset, "shuffle")
+            dataset_shuffle(epoch)
 
             # Update sampler epoch
             self.sampler.update_batch_sizes(epoch)

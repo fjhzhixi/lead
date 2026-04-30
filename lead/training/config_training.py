@@ -184,6 +184,10 @@ class TrainingConfig(BaseConfig):
     use_persistent_cache = True
     # If true force rebuild the cache for each training run.
     force_rebuild_data_cache = False
+    # If true enable in-memory SensorData cache for CARLA training.
+    use_memory_cache = False
+    # Optional memory cap for in-memory SensorData cache in bytes. None means unlimited.
+    memory_cache_max_bytes: int | None = None
     # Optional list of cache keys to restrict cache building.
     # Keys follow CacheKey.__str__ format, e.g. scenario_route_frame_False)
     cache_key_filter_list: list[str] | None = None
@@ -1039,7 +1043,17 @@ class TrainingConfig(BaseConfig):
             cpus_per_task = os.environ.get("SLURM_CPUS_PER_TASK")
             if cpus_per_task:
                 return int(cpus_per_task)
-        return 8
+        
+        affinity_count = None
+        try:
+            affinity_count = len(os.sched_getaffinity(0))
+        except AttributeError:
+            pass
+        cpu_count = os.cpu_count() or 8
+        if affinity_count is None:
+            return cpu_count
+        use_cpu_num = min(affinity_count, cpu_count)
+        return use_cpu_num
 
     @property
     def workers_per_cpu_cores(self):

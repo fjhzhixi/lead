@@ -138,6 +138,12 @@ class MixedDataset(torch.utils.data.Dataset):
         for dataset in self.datasets:
             dataset.shuffle(epoch)
 
+    def set_current_epoch(self, epoch: int):
+        """Propagate current epoch to datasets that support epoch-aware behavior."""
+        for dataset in self.datasets:
+            if hasattr(dataset, "set_current_epoch"):
+                dataset.set_current_epoch(epoch)
+
 
 class MixedSampler(torch.utils.data.BatchSampler):
     @beartype
