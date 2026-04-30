@@ -170,12 +170,28 @@ class TrainingConfig(BaseConfig):
     # If true continue the training from a failed training checkpoint.
     continue_failed_training = False
 
+    @overridable_property
+    def save_ckpt_every_n_epochs(self):
+        """Keep one checkpoint every N epochs. -1 disables periodic retention."""
+        return -1
+
     @property
     def epoch_checkpoints_keep(self):
-        """Number of checkpoints to keep during training."""
-        if self.carla_leaderboard_mode and not self.mixed_data_training:
-            return []
-        return [sum([1 * 2**i for i in range(n)]) for n in range(3, 10)]
+        """Epoch indices whose checkpoints should be retained across saves."""
+        keep_epochs = []
+
+        if self.save_ckpt_every_n_epochs > 0:
+            keep_epochs.extend(
+                range(
+                    self.save_ckpt_every_n_epochs,
+                    self.epochs,
+                    self.save_ckpt_every_n_epochs,
+                ),
+            )
+        else:
+            keep_epochs.extend([sum([1 * 2**i for i in range(n)]) for n in range(3, 10)])
+
+        return keep_epochs
 
     # --- Training cache ---
     # If true use training session cache. This cache reduces data loading time.
