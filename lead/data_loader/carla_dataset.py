@@ -125,6 +125,19 @@ class CARLAData(Dataset):
             return True
         return str(cache_key) in key_filter_set
 
+    def _sample_cache_key_strings(self, index: int) -> tuple[str, str]:
+        """Build the normal and perturbated cache key strings for a dataset sample."""
+        image_path_str = str(self.images[index], encoding="utf-8")
+        normal_key = self._build_cache_key_string(
+            image_path_str=image_path_str,
+            perturbated=False,
+        )
+        perturbated_key = self._build_cache_key_string(
+            image_path_str=image_path_str,
+            perturbated=True,
+        )
+        return normal_key, perturbated_key
+
     def set_current_epoch(self, epoch: int) -> None:
         """Set current epoch for memory cache fill policy shared with workers."""
         with self.current_epoch_shared.get_lock():
@@ -190,6 +203,24 @@ class CARLAData(Dataset):
         self.sensor_memory_cache_inserts += 1
 
     def __getitem__(self, index):
+        try:
+            return self._getitem_impl(index)
+        except Exception:
+            normal_key, perturbated_key = self._sample_cache_key_strings(index)
+            measurement_file = str(self.metas[index], encoding="utf-8")
+            LOG.exception(
+                "Failed to process sample index=%d global_index=%s bucket_identity=%s "
+                "measurement_file=%s cache_key=%s cache_key_perturbated=%s",
+                index,
+                self.global_indices[index],
+                self.bucket_identity[index],
+                measurement_file,
+                normal_key,
+                perturbated_key,
+            )
+            raise
+
+    def _getitem_impl(self, index):
         # ----------------------------------------------------------------------------------------
         # First part of the dataloader: lightweight meta data
         # ----------------------------------------------------------------------------------------
