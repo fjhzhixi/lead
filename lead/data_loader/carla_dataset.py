@@ -1034,7 +1034,7 @@ class CARLAData(Dataset):
             depth_path = self.depth[index]
             radar_path = self.radars[index]
 
-        lidar_path = self.lidars[index]  # LiDAR is always the same
+        lidar_path = self.lidars[index] if self.config.use_lidar else None
         boxes_path = self.bboxes[index]  # Boxes are always the same
 
         bev_3rd_person_images = image = raw_image_bytes = rasterized_lidar = (
@@ -1070,19 +1070,22 @@ class CARLAData(Dataset):
             radars4 = radars["radar4"]
             radars = (radars1, radars2, radars3, radars4)
 
-        # Load LiDAR BEV
-        las_object = laspy.read(str(lidar_path, encoding="utf-8"))
-        lidar_pc_i = las_object.xyz
-        lidar_timestamp = las_object["time"]
-        lidar_pc_i = lidar_pc_i[lidar_timestamp < self.config.training_used_lidar_steps]
-        rasterized_lidar = rasterize_lidar(
-            config=self.config,
-            lidar=common_utils.align_lidar(
-                lidar_pc_i,
-                np.array([0, perturbation_translation, 0]),
-                np.deg2rad(perturbation_rotation),
-            ),
-        )
+        # Load LiDAR BEV only when the training config uses LiDAR inputs.
+        if self.config.use_lidar:
+            las_object = laspy.read(str(lidar_path, encoding="utf-8"))
+            lidar_pc_i = las_object.xyz
+            lidar_timestamp = las_object["time"]
+            lidar_pc_i = lidar_pc_i[
+                lidar_timestamp < self.config.training_used_lidar_steps
+            ]
+            rasterized_lidar = rasterize_lidar(
+                config=self.config,
+                lidar=common_utils.align_lidar(
+                    lidar_pc_i,
+                    np.array([0, perturbation_translation, 0]),
+                    np.deg2rad(perturbation_rotation),
+                ),
+            )
 
         # Load semantic
         if self.config.use_semantic:

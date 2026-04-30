@@ -361,12 +361,25 @@ class TrainingConfig(BaseConfig):
     @overridable_property
     def radar_detection(self):
         """If true use radar points as additional input to the model."""
+        if self.use_only_camera:
+            return False
         return self.carla_leaderboard_mode
 
     @overridable_property
     def use_radar_detection(self):
         """If true use radar points as additional input to the model."""
+        if self.use_only_camera:
+            return False
         return self.carla_leaderboard_mode
+
+    @property
+    def use_radars(self):
+        """If true use radar sensors as input during training."""
+        if self.use_only_camera:
+            return False
+        if "use_radars" in self._loaded_config:
+            return bool(self._loaded_config["use_radars"])
+        return BaseConfig.use_radars
 
     # Fixed number of radar points per sensor.
     num_radar_points_per_sensor = 75
@@ -490,6 +503,11 @@ class TrainingConfig(BaseConfig):
             return False
         return True
 
+    @overridable_property
+    def use_only_camera(self):
+        """If true, train CARLA with camera-only sensor inputs."""
+        return False
+
     # --- Depth ---
     @overridable_property
     def use_depth(self):
@@ -497,6 +515,15 @@ class TrainingConfig(BaseConfig):
         return self.carla_leaderboard_mode
 
     # --- LiDAR setting ---
+    @property
+    def use_lidar(self):
+        """If true use LiDAR sensor input for CARLA training."""
+        if self.use_only_camera:
+            return False
+        if "use_lidar" in self._loaded_config:
+            return bool(self._loaded_config["use_lidar"])
+        return True
+
     @property
     def training_used_lidar_steps(self):
         """We stack lidar frames for motion cues. Number of past frames we stack for the model input."""
@@ -798,8 +825,15 @@ class TrainingConfig(BaseConfig):
     image_architecture = "resnet34"
     # Architecture name for LiDAR encoder backbone.
     lidar_architecture = "resnet34"
-    # Latent TF
-    LTF = False
+
+    @property
+    def LTF(self):
+        """If true replace rasterized LiDAR with a latent positional grid."""
+        if self.use_only_camera:
+            return True
+        if "LTF" in self._loaded_config:
+            return bool(self._loaded_config["LTF"])
+        return False
 
     # GPT Encoder
     # Block expansion factor for GPT layers.

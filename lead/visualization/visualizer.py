@@ -88,23 +88,36 @@ class Visualizer:
         start_color = np.array([255, 255, 255], dtype=np.float32)
         end_color = np.array(constants.LIDAR_COLOR, dtype=np.float32)
 
-        bev = self.rasterized_lidar.detach().cpu().numpy()[0][0]
-        bev = bev / (bev.max() + 1e-6)
-        bev = bev.astype(np.float32)
+        if self.rasterized_lidar is not None:
+            bev = self.rasterized_lidar.detach().cpu().numpy()[0][0]
+            bev = bev / (bev.max() + 1e-6)
+            bev = bev.astype(np.float32)
 
-        bev_img = np.zeros((*bev.shape, 3), dtype=np.float32)
-        for c in range(3):
-            bev_img[..., c] = start_color[c] + (end_color[c] - start_color[c]) * bev
-        bev_img = bev_img.astype(np.uint8)
+            bev_img = np.zeros((*bev.shape, 3), dtype=np.float32)
+            for c in range(3):
+                bev_img[..., c] = (
+                    start_color[c] + (end_color[c] - start_color[c]) * bev
+                )
+            bev_img = bev_img.astype(np.uint8)
 
-        self.bev_image = cv2.resize(
-            bev_img,
-            dsize=(
-                bev_img.shape[1] * self.scale_factor,
-                bev_img.shape[0] * self.scale_factor,
-            ),
-            interpolation=cv2.INTER_NEAREST,
-        )
+            self.bev_image = cv2.resize(
+                bev_img,
+                dsize=(
+                    bev_img.shape[1] * self.scale_factor,
+                    bev_img.shape[0] * self.scale_factor,
+                ),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        else:
+            self.bev_image = np.full(
+                (
+                    self.size_width * self.scale_factor,
+                    self.size_height * self.scale_factor,
+                    3,
+                ),
+                255,
+                dtype=np.uint8,
+            )
 
         self.meta_panel = 255 * np.ones((639, 1492, 3), dtype=np.uint8)
         if self.test_time:
