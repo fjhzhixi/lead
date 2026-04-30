@@ -112,8 +112,8 @@ class Logger:
         """
         if (
             self.config.rank == 0
-            and self.config.debug_mode
             and self.config.visualize_training
+            and self.config.logdir is not None
             and self.config.carla_leaderboard_mode
             and (
                 (epoch_iteration + 1) % self.config.log_images_frequency == 0

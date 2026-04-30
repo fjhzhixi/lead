@@ -1528,7 +1528,7 @@ def visualize_feature_maps(
     n_cols = 4
     _, axs = plt.subplots(n_rows, n_cols, figsize=(24, 12))
     images = [
-        (data["rasterized_lidar"][0, 0].detach().cpu().numpy(), "BEV LiDAR", "hot"),
+        (data["rasterized_lidar"][0, 0].detach().cpu().numpy() if "rasterized_lidar" in data else None, "BEV LiDAR", "hot"),
         (
             data["center_net_heatmap"][0, 0].detach().cpu().numpy(),
             "Heatmap Label",
@@ -1580,8 +1580,8 @@ def visualize_feature_maps(
             "Route",
             "hot",
         ),
-        (data.get("radar")[0].cpu().numpy(), "Radar Input", "hot"),
-        (data.get("radar_detections"), "Radar Detection Label", "hot"),
+        (data.get("radar")[0].cpu().numpy() if "radar" in data else None, "Radar Input", "hot"),
+        (data.get("radar_detections")[0].cpu().numpy() if "radar_detections" in data else None, "Radar Detection Label", "hot"),
         (predictions.pred_radar_predictions, "Radar Detection Prediction", "hot"),
     ]
 

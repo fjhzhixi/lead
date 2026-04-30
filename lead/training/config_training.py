@@ -1036,9 +1036,9 @@ class TrainingConfig(BaseConfig):
     def log_images_frequency(self):
         """How often to log images during training."""
         if self.debug_mode:
-            return 100
+            return 10
         
-        return 10000
+        return 1000
 
     @overridable_property
     def log_wandb(self):

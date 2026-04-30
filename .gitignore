@@ -192,7 +192,6 @@ ar1_venv
 alpasim-metric-bench2drive/
 /*.prof
 /None/
-visualization/
 3rd_party/alpamayo1.5
 outputs
 .claude/scheduled_tasks.lock
