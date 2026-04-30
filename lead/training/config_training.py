@@ -169,6 +169,8 @@ class TrainingConfig(BaseConfig):
     load_file: str = None
     # If true continue the training from a failed training checkpoint.
     continue_failed_training = False
+    # If true and a resumable checkpoint exists in logdir, resume training from it.
+    resume_training = False
 
     @overridable_property
     def save_ckpt_every_n_epochs(self):

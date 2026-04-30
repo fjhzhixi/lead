@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import random
+import re
 import typing
 
 import diskcache
@@ -34,6 +35,77 @@ LOG = logging.getLogger(__name__)
 
 
 @beartype
+def parse_model_checkpoint_epoch(checkpoint_path: pathlib.Path) -> int:
+    """Parse the epoch index from a model checkpoint path."""
+    match = re.fullmatch(r"model_(\d+)\.pth", checkpoint_path.name)
+    if match is None:
+        raise ValueError(f"Invalid model checkpoint name: {checkpoint_path.name}")
+    return int(match.group(1))
+
+
+@beartype
+def get_training_checkpoint_paths(model_checkpoint_path: pathlib.Path) -> dict[str, pathlib.Path]:
+    """Return all training state paths associated with a model checkpoint."""
+    epoch = parse_model_checkpoint_epoch(model_checkpoint_path)
+    epoch_str = f"{epoch:04d}"
+    checkpoint_dir = model_checkpoint_path.parent
+    return {
+        "model": model_checkpoint_path,
+        "optimizer": checkpoint_dir / f"optimizer_{epoch_str}.pth",
+        "scheduler": checkpoint_dir / f"scheduler_{epoch_str}.pth",
+        "scaler": checkpoint_dir / f"scaler_{epoch_str}.pth",
+        "gradient_steps_skipped": checkpoint_dir
+        / f"gradient_steps_skipped_{epoch_str}.txt",
+    }
+
+
+@beartype
+def resolve_resume_checkpoint_from_logdir(logdir: str | None) -> pathlib.Path | None:
+    """Resolve the latest resumable checkpoint from a training log directory."""
+    if logdir is None:
+        return None
+
+    logdir_path = pathlib.Path(logdir)
+    if not logdir_path.exists():
+        LOG.info(
+            "resume_training is enabled but logdir %s does not exist. Starting fresh.",
+            logdir,
+        )
+        return None
+
+    model_checkpoints = []
+    for checkpoint_path in logdir_path.glob("model_*.pth"):
+        try:
+            model_checkpoints.append((parse_model_checkpoint_epoch(checkpoint_path), checkpoint_path))
+        except ValueError:
+            continue
+
+    if not model_checkpoints:
+        LOG.info(
+            "resume_training is enabled but no model checkpoints were found in %s.",
+            logdir,
+        )
+        return None
+
+    _, latest_model_checkpoint = max(model_checkpoints, key=lambda item: item[0])
+    checkpoint_paths = get_training_checkpoint_paths(latest_model_checkpoint)
+    missing_paths = [
+        str(path)
+        for name, path in checkpoint_paths.items()
+        if name != "model" and not path.exists()
+    ]
+    if missing_paths:
+        raise RuntimeError(
+            "Latest checkpoint in "
+            f"{logdir} is incomplete for {latest_model_checkpoint.name}. Missing: "
+            + ", ".join(missing_paths),
+        )
+
+    LOG.info("Resolved auto-resume checkpoint: %s", latest_model_checkpoint)
+    return latest_model_checkpoint
+
+
+@beartype
 def increase_limit_file_descriptors(n: int = 4096):
     # On some systems it is necessary to increase the limit on open file descriptors.
     try:
@@ -48,12 +120,30 @@ def increase_limit_file_descriptors(n: int = 4096):
 @beartype
 def initialize_config() -> TrainingConfig:
     config = TrainingConfig()
-    if config.load_file is not None:
+    resume_checkpoint_path = None
+    if config.resume_training:
+        resume_checkpoint_path = resolve_resume_checkpoint_from_logdir(config.logdir)
+
+    config_source_dir = None
+    if resume_checkpoint_path is not None:
+        config_source_dir = resume_checkpoint_path.parent
+    elif config.load_file is not None:
+        config_source_dir = pathlib.Path(config.load_file).parent
+
+    if config_source_dir is not None:
         with open(
-            os.path.join("/".join(config.load_file.split("/")[:-1]), "config.json"),
+            config_source_dir / "config.json",
         ) as f:
             loaded_config = json.load(f)
         config = TrainingConfig(loaded_config, raise_error_on_missing_key=False)
+
+    if resume_checkpoint_path is not None:
+        config.load_file = str(resume_checkpoint_path)
+        config.continue_failed_training = True
+        LOG.info(
+            "Auto-resuming training from %s",
+            config.load_file,
+        )
     return config
 
 
@@ -120,10 +210,9 @@ def initialize_model(
     start_epoch = 0  # Epoch to continue training from
     if config.load_file is not None:
         LOG.info(f"Loading model from {config.load_file}")
-        # Add +1 because the epoch before that was already trained
-        load_name = str(pathlib.Path(config.load_file).stem)
+        checkpoint_epoch = parse_model_checkpoint_epoch(pathlib.Path(config.load_file))
         if config.continue_failed_training:
-            start_epoch = int("".join(filter(str.isdigit, load_name))) + 1
+            start_epoch = checkpoint_epoch + 1
             LOG.info(f"Continuing training from epoch {start_epoch}")
         model.load_state_dict(
             torch.load(config.load_file, map_location=config.device, weights_only=True),
@@ -201,18 +290,20 @@ def initialize_optimizer(
         )
 
     if config.load_file is not None and config.continue_failed_training:
+        checkpoint_paths = get_training_checkpoint_paths(pathlib.Path(config.load_file))
         scheduler.load_state_dict(
             torch.load(
-                config.load_file.replace("model_", "scheduler_"),
+                checkpoint_paths["scheduler"],
                 map_location=config.device,
                 weights_only=True,
             ),
         )
 
     if config.load_file is not None and config.continue_failed_training:
+        checkpoint_paths = get_training_checkpoint_paths(pathlib.Path(config.load_file))
         optimizer.load_state_dict(
             torch.load(
-                config.load_file.replace("model_", "optimizer_"),
+                checkpoint_paths["optimizer"],
                 map_location=config.device,
                 weights_only=True,
             ),
@@ -226,9 +317,10 @@ def initialize_optimizer(
         enabled=config.need_grad_scaler,
     )
     if config.load_file is not None and config.continue_failed_training:
+        checkpoint_paths = get_training_checkpoint_paths(pathlib.Path(config.load_file))
         scaler.load_state_dict(
             torch.load(
-                config.load_file.replace("model_", "scaler_"),
+                checkpoint_paths["scaler"],
                 map_location=config.device,
                 weights_only=True,
             ),
@@ -236,11 +328,9 @@ def initialize_optimizer(
 
     gradient_steps_skipped = 0
     if config.load_file is not None and config.continue_failed_training:
-        gradient_steps_skipped_path = config.load_file.replace(
-            "model_",
-            "gradient_steps_skipped_",
-        ).replace(".pth", ".txt")
-        if os.path.exists(gradient_steps_skipped_path):
+        checkpoint_paths = get_training_checkpoint_paths(pathlib.Path(config.load_file))
+        gradient_steps_skipped_path = checkpoint_paths["gradient_steps_skipped"]
+        if gradient_steps_skipped_path.exists():
             with open(gradient_steps_skipped_path) as f:
                 gradient_steps_skipped = int(f.read().strip())
 
