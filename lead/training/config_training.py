@@ -893,7 +893,12 @@ class TrainingConfig(BaseConfig):
     # If true use CARLA data for training.
     use_carla_data = True
     # Number of CARLA samples to use in mixed data training. -1 = use all data.
-    carla_num_samples = -1
+    @overridable_property
+    def carla_num_samples(self):
+        """Number of CARLA samples to use for training."""
+        if self.debug_mode:
+            return 10
+        return -1
     # If true use NavSim data for training.
     use_navsim_data = False
     # NavSim data root directory.
