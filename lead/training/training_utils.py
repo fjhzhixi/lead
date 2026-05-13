@@ -124,20 +124,12 @@ def initialize_config() -> TrainingConfig:
     if config.resume_training:
         resume_checkpoint_path = resolve_resume_checkpoint_from_logdir(config.logdir)
 
-    config_source_dir = None
     if resume_checkpoint_path is not None:
-        config_source_dir = resume_checkpoint_path.parent
-    elif config.load_file is not None:
-        config_source_dir = pathlib.Path(config.load_file).parent
-
-    if config_source_dir is not None:
         with open(
-            config_source_dir / "config.json",
+            resume_checkpoint_path.parent / "config.json",
         ) as f:
             loaded_config = json.load(f)
         config = TrainingConfig(loaded_config, raise_error_on_missing_key=False)
-
-    if resume_checkpoint_path is not None:
         config.load_file = str(resume_checkpoint_path)
         config.continue_failed_training = True
         LOG.info(
