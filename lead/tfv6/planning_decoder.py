@@ -395,25 +395,31 @@ class PlanningDecoder(nn.Module):
                 # Expert action label: [steer, throttle - brake] in [-1, 1]
                 steer_label = data["steer"].to(
                     self.device,
-                    dtype=self.config.torch_float_type,
+                    dtype=torch.float32,
                     non_blocking=True,
                 )
                 throttle_label = data["throttle"].to(
                     self.device,
-                    dtype=self.config.torch_float_type,
+                    dtype=torch.float32,
                     non_blocking=True,
                 )
                 brake_float_label = data["brake"].to(
                     self.device,
-                    dtype=self.config.torch_float_type,
+                    dtype=torch.float32,
                     non_blocking=True,
                 )
                 action_label = torch.stack(
                     [steer_label, throttle_label - brake_float_label], dim=-1
                 )
-                # Scale from [-1, 1] to (0, 1) for the Beta distribution
+                # Keep labels strictly inside the open Beta support. This must stay
+                # in fp32: in bf16, 1 - 1e-6 rounds back to 1.0 and produces
+                # infinite gradients at the distribution boundary.
+                action_label = torch.clamp(action_label.float(), -1.0, 1.0)
+                beta_label_eps = 1e-4
                 action_label_scaled = torch.clamp(
-                    (action_label + 1.0) / 2.0, 1e-6, 1 - 1e-6
+                    (action_label + 1.0) / 2.0,
+                    beta_label_eps,
+                    1.0 - beta_label_eps,
                 )
                 self.action_dist.proba_distribution(
                     predictions.pred_action_beta_alpha.float(),
