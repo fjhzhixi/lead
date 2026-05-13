@@ -109,7 +109,7 @@ class TFv6(nn.Module):
         self.log = {}
         pred_route = pred_future_waypoints = pred_target_speed_distribution = (
             pred_target_speed_scalar
-        ) = pred_headings = None
+        ) = pred_headings = pred_action_beta_alpha = pred_action_beta_beta = None
         pred_semantic = pred_depth = pred_bounding_box = pred_bev_semantic = None
         pred_bounding_box_navsim = pred_bev_semantic_navsim = None
 
@@ -133,6 +133,8 @@ class TFv6(nn.Module):
                 pred_target_speed_distribution,
                 pred_target_speed_scalar,
                 pred_headings,
+                pred_action_beta_alpha,
+                pred_action_beta_beta,
             ) = self.planning_decoder(
                 bev_features,
                 planner_radar_features,
@@ -196,6 +198,8 @@ class TFv6(nn.Module):
             pred_bounding_box_navsim=pred_bounding_box_navsim,
             pred_bev_semantic_navsim=pred_bev_semantic_navsim,
             pred_headings=pred_headings,
+            pred_action_beta_alpha=pred_action_beta_alpha,
+            pred_action_beta_beta=pred_action_beta_beta,
         )
 
     @beartype
@@ -309,3 +313,5 @@ class Prediction:
         jt.Float[torch.Tensor, "bs num_bev_classes_navsim bev_height bev_width"] | None
     )
     pred_headings: jt.Float[torch.Tensor, "bs n_waypoints"] | None
+    pred_action_beta_alpha: jt.Float[torch.Tensor, "bs 2"] | None
+    pred_action_beta_beta: jt.Float[torch.Tensor, "bs 2"] | None

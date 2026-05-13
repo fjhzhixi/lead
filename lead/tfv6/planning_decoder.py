@@ -1,11 +1,13 @@
 import logging
 import math
+from typing import Tuple
 
 import jaxtyping as jt
 import torch
 import torch.nn.functional as F
 from beartype import beartype
 from torch import nn
+from torch.distributions import Beta
 
 import lead.common.common_utils as common_utils
 from lead.common.constants import RadarLabels
@@ -13,6 +15,119 @@ from lead.tfv6 import transfuser_utils as fn
 from lead.training.config_training import TrainingConfig
 
 logger = logging.getLogger(__name__)
+
+
+class BetaDistribution(nn.Module):
+  '''
+  Wrapper around the torch Beta distribution with some additional functionality.
+  '''
+
+  def __init__(self, action_dim=2, dist_init=None):
+    super().__init__()
+    assert action_dim == 2
+
+    self.distribution = None
+    self.action_dim = action_dim
+    self.dist_init = dist_init
+    self.low = 0.0
+    self.high = 1.0
+
+    # [alpha, beta], [0, 1] # Changed order from original repo to have alpha first.
+    self.suggest_go = nn.Parameter(torch.FloatTensor([2.5, 1.0]), requires_grad=False)
+    self.suggest_stop = nn.Parameter(torch.FloatTensor([1.0, 1.5]), requires_grad=False)
+    self.suggest_turn = nn.Parameter(torch.FloatTensor([1.0, 1.0]), requires_grad=False)
+
+  def proba_distribution_net(self, latent_dim: int) -> Tuple[nn.Module, nn.Module]:
+
+    linear_alpha = nn.Linear(latent_dim, self.action_dim)
+    linear_beta = nn.Linear(latent_dim, self.action_dim)
+
+    if self.dist_init is not None:
+      # acc
+      linear_alpha.bias.data[0] = self.dist_init[0][1]
+      linear_beta.bias.data[0] = self.dist_init[0][0]
+      # steer
+      linear_alpha.bias.data[1] = self.dist_init[1][1]
+      linear_beta.bias.data[1] = self.dist_init[1][0]
+
+    alpha = nn.Sequential(linear_alpha)
+    beta = nn.Sequential(linear_beta)
+    return alpha, beta
+
+  def proba_distribution(self, alpha, beta):
+    self.distribution = Beta(alpha, beta)
+    return self
+
+  def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+    log_prob = self.distribution.log_prob(actions)
+    return sum_independent_dims(log_prob)
+
+  def entropy(self):
+    return self.distribution.entropy()
+
+  def exploration_loss(self, exploration_suggests) -> torch.Tensor:
+    alpha = self.distribution.concentration1.detach().clone()
+    beta = self.distribution.concentration0.detach().clone()
+
+    # 0: '', ''
+    # 1: 'go', ''
+    # 2: 'go', 'turn'
+    # 3: 'stop', ''
+    for i, suggest_indx in enumerate(exploration_suggests):
+      # Index 0 means original
+      if suggest_indx == 1:  # Blocked
+        # No steer suggest
+        alpha[i, 1] = self.suggest_go[0]
+        beta[i, 1] = self.suggest_go[1]
+      elif suggest_indx == 2:  # Route deviation
+        alpha[i, 0] = self.suggest_turn[0]
+        beta[i, 0] = self.suggest_turn[1]
+
+        alpha[i, 1] = self.suggest_go[0]
+        beta[i, 1] = self.suggest_go[1]
+      elif suggest_indx == 3:  # Collision, red light, stop sign
+        alpha[i, 1] = self.suggest_stop[0]
+        beta[i, 1] = self.suggest_stop[1]
+
+    dist_ent = Beta(alpha, beta)
+
+    exploration_loss = torch.distributions.kl_divergence(self.distribution, dist_ent)
+    return torch.mean(exploration_loss)
+
+  def sample(self) -> torch.Tensor:
+    # Reparametrization trick to pass gradients
+    return self.distribution.rsample()
+
+  def mode(self) -> torch.Tensor:
+    alpha = self.distribution.concentration1
+    beta = self.distribution.concentration0
+    x = torch.zeros_like(alpha)
+    x[:, 1] += 0.5
+    mask1 = (alpha > 1) & (beta > 1)
+    x[mask1] = (alpha[mask1] - 1) / (alpha[mask1] + beta[mask1] - 2)
+
+    mask2 = (alpha <= 1) & (beta > 1)
+    x[mask2] = 0.0
+
+    mask3 = (alpha > 1) & (beta <= 1)
+    x[mask3] = 1.0
+
+    # mean
+    mask4 = (alpha <= 1) & (beta <= 1)
+    x[mask4] = self.distribution.mean[mask4]
+
+    return x
+
+  def evaluate_mean(self) -> torch.Tensor:
+    return self.distribution.mean
+
+  def get_actions(self, sample_type='sample') -> torch.Tensor:
+    if sample_type == 'roach':
+      return self.mode()
+    elif sample_type == 'mean':
+      return self.evaluate_mean()
+    else:
+      return self.sample()
 
 
 class PlanningDecoder(nn.Module):
@@ -32,7 +147,7 @@ class PlanningDecoder(nn.Module):
             device=self.device,
         )
 
-        # Number of queries: route + waypoints + target_speed (flexible based on config)
+        # Number of queries: route + waypoints + target_speed + beta action (flexible based on config)
         num_queries = 0
         if self.config.predict_spatial_path:
             num_queries += self.config.num_route_points_prediction
@@ -40,6 +155,9 @@ class PlanningDecoder(nn.Module):
             num_queries += self.config.num_way_points_prediction
         if self.config.predict_target_speed:
             num_queries += 1
+        if self.config.predict_beta_action:
+            # Raw action mode uses separate queries for alpha and beta of the Beta distribution.
+            num_queries += 2
 
         self.query = nn.Parameter(
             torch.zeros(
@@ -80,6 +198,13 @@ class PlanningDecoder(nn.Module):
                 ),
             )
 
+        # Beta action head for IL/BC training: predicts Beta distribution over [steer, throttle_brake]
+        if self.config.predict_beta_action:
+            self.action_dist = BetaDistribution(action_dim=2)
+            self.action_beta_alpha_net, self.action_beta_beta_net = (
+                self.action_dist.proba_distribution_net(config.transfuser_token_dim)
+            )
+
         self.tp_normalization_constants = torch.tensor(
             self.config.target_points_normalization_constants,
             device=self.device,
@@ -101,10 +226,12 @@ class PlanningDecoder(nn.Module):
         log: dict,
     ) -> tuple[
         jt.Float[torch.Tensor, "B n_checkpoints 2"] | None,
-        jt.Float[torch.Tensor, "B n_waypoints 2"],
+        jt.Float[torch.Tensor, "B n_waypoints 2"] | None,
         jt.Float[torch.Tensor, "B speed_classes"] | None,
         jt.Float[torch.Tensor, " B"] | None,
         jt.Float[torch.Tensor, "B n_waypoints"] | None,
+        jt.Float[torch.Tensor, "B 2"] | None,
+        jt.Float[torch.Tensor, "B 2"] | None,
     ]:
         """
         Args:
@@ -121,15 +248,16 @@ class PlanningDecoder(nn.Module):
             headings: Heading predictions (if using NavSim data).
         """
         self.kv = context_tokens = self.planning_context_encoder(
-            bev_features=bev_features,
-            radar_logits=radar_features,
-            radar_predictions=radar_predictions,
+            bev_features=bev_features,                  # [B, 512, 10, 12]
+            radar_logits=radar_features,                # None for use_only_camera
+            radar_predictions=radar_predictions,        # None for use_only_camera
             data=data,
             log=log,
-        )
+        )           # [B, 125, 256]
 
         bs = context_tokens.shape[0]
 
+        # [route points + waypoints + target speed + 2 beta action queries] x 256
         queries = self.transformer_decoder(self.query.repeat(bs, 1, 1), context_tokens)
 
         # Split the queries flexibly based on what we're predicting
@@ -139,6 +267,8 @@ class PlanningDecoder(nn.Module):
         headings = None
         target_speed_dist = None
         target_speed_scalar = None
+        action_beta_alpha = None
+        action_beta_beta = None
 
         if self.config.predict_spatial_path:
             route_queries = queries[
@@ -169,6 +299,21 @@ class PlanningDecoder(nn.Module):
                     self.config.target_speed_classes,
                     self.device,
                 )
+            query_idx += 1
+
+        if self.config.predict_beta_action:
+            action_alpha_query = queries[:, query_idx]
+            action_beta_query = queries[:, query_idx + 1]
+            # Apply softplus + min_concentration to ensure alpha, beta > 1.0
+            action_beta_alpha = (
+                F.softplus(self.action_beta_alpha_net(action_alpha_query))
+                + self.config.beta_action_min_concentration
+            )
+            action_beta_beta = (
+                F.softplus(self.action_beta_beta_net(action_beta_query))
+                + self.config.beta_action_min_concentration
+            )
+            query_idx += 2
 
         return (
             route,
@@ -176,6 +321,8 @@ class PlanningDecoder(nn.Module):
             target_speed_dist,
             target_speed_scalar,
             headings.squeeze(-1) if headings is not None else None,
+            action_beta_alpha,
+            action_beta_beta,
         )
 
     @beartype
@@ -243,6 +390,47 @@ class PlanningDecoder(nn.Module):
                     predictions.pred_route[:, -1, :].float(),
                     route_label[:, -1, :].float(),
                 )  # FDE
+
+            if self.config.predict_beta_action:
+                # Expert action label: [steer, throttle - brake] in [-1, 1]
+                steer_label = data["steer"].to(
+                    self.device,
+                    dtype=self.config.torch_float_type,
+                    non_blocking=True,
+                )
+                throttle_label = data["throttle"].to(
+                    self.device,
+                    dtype=self.config.torch_float_type,
+                    non_blocking=True,
+                )
+                brake_float_label = data["brake"].to(
+                    self.device,
+                    dtype=self.config.torch_float_type,
+                    non_blocking=True,
+                )
+                action_label = torch.stack(
+                    [steer_label, throttle_label - brake_float_label], dim=-1
+                )
+                # Scale from [-1, 1] to (0, 1) for the Beta distribution
+                action_label_scaled = torch.clamp(
+                    (action_label + 1.0) / 2.0, 1e-6, 1 - 1e-6
+                )
+                self.action_dist.proba_distribution(
+                    predictions.pred_action_beta_alpha.float(),
+                    predictions.pred_action_beta_beta.float(),
+                )
+                log_prob = (
+                    self.action_dist.distribution.log_prob(action_label_scaled)
+                    .sum(dim=-1)
+                    .mean()
+                )
+                entropy = (
+                    self.action_dist.distribution.entropy().sum(dim=-1).mean()
+                )
+                loss["loss_bc_action"] = (
+                    -log_prob
+                    -self.config.beta_action_entropy_coef * entropy
+                )
 
         if (
             "iteration" in data

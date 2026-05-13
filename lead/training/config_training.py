@@ -716,18 +716,40 @@ class TrainingConfig(BaseConfig):
     @property
     def predict_target_speed(self):
         """If true predict target speed."""
-        return self.carla_leaderboard_mode
+        return self.use_waypoints_action and self.carla_leaderboard_mode
 
     @property
     def predict_spatial_path(self):
         """If true predict spatial path."""
-        return self.carla_leaderboard_mode
+        return self.use_waypoints_action and self.carla_leaderboard_mode
 
-    # If true predict temporal spatial waypoints.
-    predict_temporal_spatial_waypoints = True
+    @property
+    def predict_temporal_spatial_waypoints(self):
+        """If true predict temporal spatial waypoints."""
+        return self.use_waypoints_action
 
     # If true model will use the planning decoder.
     use_planning_decoder = False
+
+    # If true use the original waypoint/route/speed planning outputs.
+    use_waypoints_action = True
+
+    # If true use Beta distribution raw action prediction over [steer, throttle_brake].
+    use_raw_action = False
+
+    # If true, predict a Beta distribution over the current action [steer, throttle_brake]
+    # for IL/BC training. Works independently of all other planning heads.
+    # Only active when use_planning_decoder=True.
+    @property
+    def predict_beta_action(self):
+        """If true enable Beta distribution raw action prediction head."""
+        return self.use_raw_action
+
+    # Entropy regularization coefficient for the Beta action IL loss.
+    beta_action_entropy_coef = 1e-2
+
+    # Minimum concentration parameter value for the Beta distribution (keeps alpha/beta > 0).
+    beta_action_min_concentration = 1.0
 
     @property
     def target_speed_classes(self):
@@ -1037,6 +1059,7 @@ class TrainingConfig(BaseConfig):
                 "loss_spatio_temporal_waypoints": 1.0,
                 "loss_target_speed": 1.0,
                 "loss_spatial_route": 1.0,
+                "loss_bc_action": 10.0,
             },
         )
 
@@ -1045,6 +1068,19 @@ class TrainingConfig(BaseConfig):
             weights["loss_spatio_temporal_waypoints"] = 0.0
             weights["loss_spatial_route"] = 0.0
             weights["loss_target_speed"] = 0.0
+            weights["loss_bc_action"] = 0.0
+
+        if not self.predict_temporal_spatial_waypoints:
+            weights["loss_spatio_temporal_waypoints"] = 0.0
+
+        if not self.predict_spatial_path:
+            weights["loss_spatial_route"] = 0.0
+
+        if not self.predict_target_speed:
+            weights["loss_target_speed"] = 0.0
+
+        if not self.predict_beta_action:
+            weights["loss_bc_action"] = 0.0
 
         return weights
 
