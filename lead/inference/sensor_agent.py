@@ -207,10 +207,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     @beartype
     def sensors(self) -> list[dict]:
+        use_vehicle_sensors = not self.training_config.use_only_camera
         return av_sensor_setup(
             config=self.training_config,
-            lidar=True,
-            radar=True,
+            lidar=use_vehicle_sensors,
+            radar=use_vehicle_sensors,
             sensor_agent=True,
             perturbate=False,
             perturbation_rotation=0.0,
@@ -287,6 +288,8 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         input_data = super().tick(
             input_data,
             use_kalman_filter=self.training_config.use_kalman_filter_for_gps,
+            use_lidar=not self.training_config.use_only_camera,
+            use_radars=not self.training_config.use_only_camera,
         )
 
         # Simulate JPEG compression to avoid train-test mismatch
@@ -378,39 +381,40 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             # Skip the next target point if it's too far away
             input_data["target_point_next"] = input_data["target_point"]
 
-        # Lidar input
-        lidar = self.accumulate_lidar()
-        # Use only part of the lidar history we trained on
-        lidar = lidar[lidar[:, -1] < self.training_config.training_used_lidar_steps]
+        if not self.training_config.use_only_camera:
+            # Lidar input
+            lidar = self.accumulate_lidar()
+            # Use only part of the lidar history we trained on
+            lidar = lidar[lidar[:, -1] < self.training_config.training_used_lidar_steps]
 
-        # At inference time, simulate laspy quantization to avoid train-test mismatch
-        lidar[:, 0] = (
-            np.round(lidar[:, 0] / self.config_expert.point_precision_x)
-            * self.config_expert.point_precision_x
-        )
-        lidar[:, 1] = (
-            np.round(lidar[:, 1] / self.config_expert.point_precision_y)
-            * self.config_expert.point_precision_y
-        )
-        lidar[:, 2] = (
-            np.round(lidar[:, 2] / self.config_expert.point_precision_z)
-            * self.config_expert.point_precision_z
-        )
+            # At inference time, simulate laspy quantization to avoid train-test mismatch
+            lidar[:, 0] = (
+                np.round(lidar[:, 0] / self.config_expert.point_precision_x)
+                * self.config_expert.point_precision_x
+            )
+            lidar[:, 1] = (
+                np.round(lidar[:, 1] / self.config_expert.point_precision_y)
+                * self.config_expert.point_precision_y
+            )
+            lidar[:, 2] = (
+                np.round(lidar[:, 2] / self.config_expert.point_precision_z)
+                * self.config_expert.point_precision_z
+            )
 
-        # Convert to pseudo image
-        input_data["rasterized_lidar"] = rasterize_lidar(
-            config=self.training_config,
-            lidar=lidar[:, :3],
-        )[..., None]
+            # Convert to pseudo image
+            input_data["rasterized_lidar"] = rasterize_lidar(
+                config=self.training_config,
+                lidar=lidar[:, :3],
+            )[..., None]
 
-        # Simulate training time compression to avoid train-test mismatch
-        input_data["rasterized_lidar"] = training_cache.compress_float_image(
-            input_data["rasterized_lidar"],
-            self.training_config,
-        )
-        input_data["rasterized_lidar"] = training_cache.decompress_float_image(
-            input_data["rasterized_lidar"],
-        ).squeeze()[None, None]
+            # Simulate training time compression to avoid train-test mismatch
+            input_data["rasterized_lidar"] = training_cache.compress_float_image(
+                input_data["rasterized_lidar"],
+                self.training_config,
+            )
+            input_data["rasterized_lidar"] = training_cache.decompress_float_image(
+                input_data["rasterized_lidar"],
+            ).squeeze()[None, None]
 
         # Radar input preprocessing
         if self.training_config.use_radars:
@@ -449,10 +453,6 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             "rgb": torch.Tensor(input_data["rgb"]).to(self.device, dtype=torch.float32)[
                 None
             ],
-            "rasterized_lidar": torch.Tensor(input_data["rasterized_lidar"]).to(
-                self.device,
-                dtype=torch.float32,
-            ),
             "target_point_previous": torch.Tensor(input_data["target_point_previous"])
             .to(self.device, dtype=torch.float32)
             .view(1, 2),
@@ -476,6 +476,13 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             .view(1, 6),
             "town": np.array([self._world.get_map().name.split("/")[-1]]),
         }
+        if not self.training_config.use_only_camera:
+            input_data_tensors["rasterized_lidar"] = torch.Tensor(
+                input_data["rasterized_lidar"],
+            ).to(
+                self.device,
+                dtype=torch.float32,
+            )
 
         # Add radar data if available
         if self.training_config.use_radars and "radar" in input_data:
@@ -834,6 +841,8 @@ class ForceMovePostProcessor:
 
         if self.force_move > 0:
             emergency_stop = False
+            if len(self.lidar_buffer) == 0:
+                return current_throttle, current_brake
             # safety check
             safety_box = deepcopy(self.lidar_buffer[-1])
 

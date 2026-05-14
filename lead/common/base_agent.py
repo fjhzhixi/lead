@@ -80,7 +80,13 @@ class BaseAgent:
             self.gps_waypoint_planners_dict[dist] = planner
 
     @beartype
-    def tick(self, input_data: dict, use_kalman_filter: bool = True) -> dict:
+    def tick(
+        self,
+        input_data: dict,
+        use_kalman_filter: bool = True,
+        use_lidar: bool = True,
+        use_radars: bool = True,
+    ) -> dict:
         # Get the vehicle's speed from sensor
         speed = input_data["speed"][1]["speed"]
         self.speeds_queue.append(speed)
@@ -137,104 +143,106 @@ class BaseAgent:
             },
         )
 
-        # --- LiDAR ---
-        input_data["lidar"] = common_utils.lidar_to_ego_coordinate(
-            self.config_expert.lidar_rot_1,
-            self.config_expert.lidar_pos_1,
-            input_data["lidar1"],
-        )
-        if self.config_expert.use_two_lidars:
-            input_data["lidar"] = np.concatenate(
-                (
-                    input_data["lidar"],
-                    common_utils.lidar_to_ego_coordinate(
-                        self.config_expert.lidar_rot_2,
-                        self.config_expert.lidar_pos_2,
-                        input_data["lidar2"],
-                    ),
-                ),
-                axis=0,
+        if use_lidar:
+            # --- LiDAR ---
+            input_data["lidar"] = common_utils.lidar_to_ego_coordinate(
+                self.config_expert.lidar_rot_1,
+                self.config_expert.lidar_pos_1,
+                input_data["lidar1"],
             )
-        lidar_x, lidar_y = input_data["lidar"][:, 0], input_data["lidar"][:, 1]
-        # Remove lidar points inside ego bounding boxes. We already need LiDAR for expert.
-        input_data["lidar"] = input_data["lidar"][
-            (np.abs(lidar_x) > self.config_expert.ego_extent_x)
-            & (np.abs(lidar_y) > self.config_expert.ego_extent_y)
-        ]
-        original_lidar_num_points = input_data["lidar"].shape[0]
-
-        # --- Radar ---
-        if self.config_expert.use_radars:
-            radar_processed = {}
-            radar_points_list = []
-
-            for i in range(1, self.config_expert.num_radar_sensors + 1):
-                radar = common_utils.radar_points_to_ego(
-                    input_data[f"radar{i}"][1],
-                    sensor_pos=self.config_expert.radar_calibration[str(i)]["pos"],
-                    sensor_rot=self.config_expert.radar_calibration[str(i)]["rot"],
-                )
-                radar_processed[f"radar{i}"] = radar
-                radar_points_list.append(radar[:, :3])
-
-            self.radar_pc_queue.append(np.concatenate(radar_points_list, axis=0))
-            input_data.update(radar_processed)
-
-            # Add radar point clouds to LiDAR point cloud if configured
-            if self.config_expert.save_radar_pc_as_lidar:
+            if self.config_expert.use_two_lidars:
                 input_data["lidar"] = np.concatenate(
-                    [input_data["lidar"], self.radar_pc_queue[-1]],
+                    (
+                        input_data["lidar"],
+                        common_utils.lidar_to_ego_coordinate(
+                            self.config_expert.lidar_rot_2,
+                            self.config_expert.lidar_pos_2,
+                            input_data["lidar2"],
+                        ),
+                    ),
                     axis=0,
                 )
-                if self.config_expert.duplicate_radar_near_ego:
-                    radar_near_ego = self.radar_pc_queue[-1][
-                        np.linalg.norm(self.radar_pc_queue[-1][:, :2], axis=1)
-                        < self.config_expert.duplicate_radar_radius
-                    ]
-                    radar_near_ego = np.concatenate(
-                        [radar_near_ego] * self.config_expert.duplicate_radar_factor,
-                        axis=0,
+            lidar_x, lidar_y = input_data["lidar"][:, 0], input_data["lidar"][:, 1]
+            # Remove lidar points inside ego bounding boxes. We already need LiDAR for expert.
+            input_data["lidar"] = input_data["lidar"][
+                (np.abs(lidar_x) > self.config_expert.ego_extent_x)
+                & (np.abs(lidar_y) > self.config_expert.ego_extent_y)
+            ]
+            original_lidar_num_points = input_data["lidar"].shape[0]
+
+            # --- Radar ---
+            if use_radars and self.config_expert.use_radars:
+                radar_processed = {}
+                radar_points_list = []
+
+                for i in range(1, self.config_expert.num_radar_sensors + 1):
+                    radar = common_utils.radar_points_to_ego(
+                        input_data[f"radar{i}"][1],
+                        sensor_pos=self.config_expert.radar_calibration[str(i)]["pos"],
+                        sensor_rot=self.config_expert.radar_calibration[str(i)]["rot"],
                     )
+                    radar_processed[f"radar{i}"] = radar
+                    radar_points_list.append(radar[:, :3])
+
+                self.radar_pc_queue.append(np.concatenate(radar_points_list, axis=0))
+                input_data.update(radar_processed)
+
+                # Add radar point clouds to LiDAR point cloud if configured
+                if self.config_expert.save_radar_pc_as_lidar:
                     input_data["lidar"] = np.concatenate(
-                        [input_data["lidar"], radar_near_ego],
+                        [input_data["lidar"], self.radar_pc_queue[-1]],
                         axis=0,
                     )
+                    if self.config_expert.duplicate_radar_near_ego:
+                        radar_near_ego = self.radar_pc_queue[-1][
+                            np.linalg.norm(self.radar_pc_queue[-1][:, :2], axis=1)
+                            < self.config_expert.duplicate_radar_radius
+                        ]
+                        radar_near_ego = np.concatenate(
+                            [radar_near_ego] * self.config_expert.duplicate_radar_factor,
+                            axis=0,
+                        )
+                        input_data["lidar"] = np.concatenate(
+                            [input_data["lidar"], radar_near_ego],
+                            axis=0,
+                        )
 
-        # Remove lidar points on ground
-        lidar_x, lidar_y = input_data["lidar"][:, 0], input_data["lidar"][:, 1]
-        if self.config_expert.save_only_non_ground_lidar:
-            ground_mask = ransac.remove_ground(
-                input_data["lidar"],
-                self.config_expert,
-                parallel=True,
-            )
-            input_data["lidar"] = input_data["lidar"][~ground_mask]
-            # Also remove ground points from radar_pc_queue if radar points are appended to LiDAR
-            if (
-                self.config_expert.use_radars
-                and self.config_expert.save_radar_pc_as_lidar
-            ):
-                radar_ground_mask = ground_mask[original_lidar_num_points:]
-                self.radar_pc_queue[-1] = self.radar_pc_queue[-1][
-                    ~radar_ground_mask[: self.radar_pc_queue[-1].shape[0]]
-                ]  # Filter out ground points from the latest radar pc
+            # Remove lidar points on ground
+            lidar_x, lidar_y = input_data["lidar"][:, 0], input_data["lidar"][:, 1]
+            if self.config_expert.save_only_non_ground_lidar:
+                ground_mask = ransac.remove_ground(
+                    input_data["lidar"],
+                    self.config_expert,
+                    parallel=True,
+                )
+                input_data["lidar"] = input_data["lidar"][~ground_mask]
+                # Also remove ground points from radar_pc_queue if radar points are appended to LiDAR
+                if (
+                    use_radars
+                    and self.config_expert.use_radars
+                    and self.config_expert.save_radar_pc_as_lidar
+                ):
+                    radar_ground_mask = ground_mask[original_lidar_num_points:]
+                    self.radar_pc_queue[-1] = self.radar_pc_queue[-1][
+                        ~radar_ground_mask[: self.radar_pc_queue[-1].shape[0]]
+                    ]  # Filter out ground points from the latest radar pc
 
-        if self.config_expert.save_lidar_only_inside_bev:
-            lidar_x, _lidar_y, lidar_z = (
-                input_data["lidar"][:, 0],
-                input_data["lidar"][:, 1],
-                input_data["lidar"][:, 2],
-            )
-            inside_mask = (
-                (self.config_expert.min_x_meter <= lidar_x)
-                & (lidar_x <= self.config_expert.max_x_meter)
-                & (self.config_expert.min_y_meter <= _lidar_y)
-                & (_lidar_y <= self.config_expert.max_y_meter)
-                & (self.config_expert.min_height_lidar <= lidar_z)
-                & (lidar_z <= self.config_expert.max_height_lidar)
-            )
-            input_data["lidar"] = input_data["lidar"][inside_mask]
-        self.lidar_pc_queue.append(input_data["lidar"])
+            if self.config_expert.save_lidar_only_inside_bev:
+                lidar_x, _lidar_y, lidar_z = (
+                    input_data["lidar"][:, 0],
+                    input_data["lidar"][:, 1],
+                    input_data["lidar"][:, 2],
+                )
+                inside_mask = (
+                    (self.config_expert.min_x_meter <= lidar_x)
+                    & (lidar_x <= self.config_expert.max_x_meter)
+                    & (self.config_expert.min_y_meter <= _lidar_y)
+                    & (_lidar_y <= self.config_expert.max_y_meter)
+                    & (self.config_expert.min_height_lidar <= lidar_z)
+                    & (lidar_z <= self.config_expert.max_height_lidar)
+                )
+                input_data["lidar"] = input_data["lidar"][inside_mask]
+            self.lidar_pc_queue.append(input_data["lidar"])
 
         # --- Process camera images ---
         # CARLA cameras: stitch all configured cameras
