@@ -27,12 +27,16 @@ class ClosedLoopConfig(OpenLoopConfig):
     jpeg_quality = 90
 
     # --- Control which output is used for controlling ---
-    # Modality used for steering control
+    # Modality used for steering control. Options: "route", "waypoint", "raw_action"
     steer_modality = "route"
-    # Modality used for throttle control
+    # Modality used for throttle control. Options: "target_speed", "waypoint", "raw_action"
     throttle_modality = "target_speed"
-    # Modality used for brake control
+    # Modality used for brake control. Options: "target_speed", "waypoint", "raw_action"
     brake_modality = "target_speed"
+
+    # Sampling strategy when converting the Beta distribution to an action.
+    # Options: "mean" (E[Beta] = alpha/(alpha+beta)), "mode"
+    beta_action_sample_type = "mean"
 
     # --- Steering correction for slow driving ---
     # Steering correction factor

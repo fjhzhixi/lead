@@ -9,6 +9,7 @@ from lead.common.pid_controller import LateralPIDController, PIDController, get_
 from lead.expert.config_expert import ExpertConfig
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.open_loop_inference import OpenLoopInference, OpenLoopPrediction
+from lead.tfv6.planning_decoder import BetaDistribution
 from lead.tfv6.tfv6 import Prediction
 from lead.training.config_training import TrainingConfig
 
@@ -27,6 +28,9 @@ class ClosedLoopPrediction(OpenLoopPrediction):
     route_steer: float
     target_speed_throttle: float
     target_speed_brake: float
+    raw_action_steer: float | None
+    raw_action_throttle: float | None
+    raw_action_brake: float | None
 
 
 class ClosedLoopInference(OpenLoopInference):
@@ -51,6 +55,17 @@ class ClosedLoopInference(OpenLoopInference):
         self.config_training = config_training
         self.config_closed_loop = config_closed_loop
 
+        # Auto-derive control modalities from training config if not explicitly set via
+        # LEAD_CLOSED_LOOP_CONFIG. Explicit overrides in the env var always take precedence.
+        _loaded = config_closed_loop._loaded_config
+        if config_training.use_raw_action and not config_training.use_waypoints_action:
+            if "steer_modality" not in _loaded:
+                config_closed_loop.steer_modality = "raw_action"
+            if "throttle_modality" not in _loaded:
+                config_closed_loop.throttle_modality = "raw_action"
+            if "brake_modality" not in _loaded:
+                config_closed_loop.brake_modality = "raw_action"
+
         self.lateral_waypoint_controller = PIDController(
             k_p=self.config_closed_loop.turn_kp,
             k_i=self.config_closed_loop.turn_ki,
@@ -72,6 +87,41 @@ class ClosedLoopInference(OpenLoopInference):
         )
 
         self.step = 4  # Constant so produced images start with 5, not really important
+
+    @jt.jaxtyped(typechecker=beartype)
+    def execute_raw_action(
+        self,
+        pred_alpha: jt.Float[torch.Tensor, "1 2"],
+        pred_beta: jt.Float[torch.Tensor, "1 2"],
+    ) -> tuple[float, float, float]:
+        """Convert Beta distribution parameters to vehicle controls.
+
+        Decodes E[Beta] = alpha/(alpha+beta), rescales from [0,1] to [-1,1],
+        then maps to steer/throttle/brake following the reference convention:
+        positive action[1] -> throttle, negative -> brake.
+
+        Args:
+            pred_alpha: Beta distribution alpha parameters, shape [1, 2].
+            pred_beta: Beta distribution beta parameters, shape [1, 2].
+        Returns:
+            steer: Steering command in [-1, 1].
+            throttle: Throttle command in [0, 1].
+            brake: Brake command in [0, 1].
+        """
+        action_dist = BetaDistribution(action_dim=2)
+        action_dist.proba_distribution(pred_alpha.float(), pred_beta.float())
+        # E[Beta] in [0, 1]; rescale to [-1, 1]
+        mean = action_dist.evaluate_mean()[0]  # shape [2]
+        action = mean * 2.0 - 1.0
+        steer = float(action[0].item())
+        throttle_brake = float(action[1].item())
+        if throttle_brake > 0.0:
+            throttle = throttle_brake
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = -throttle_brake
+        return steer, throttle, brake
 
     @jt.jaxtyped(typechecker=beartype)
     def execute_route_and_target_speed(
@@ -210,6 +260,29 @@ class ClosedLoopInference(OpenLoopInference):
         steer = throttle = brake = waypoint_steer = waypoint_throttle = (
             waypoint_brake
         ) = route_steer = target_speed_throttle = target_speed_brake = None
+        raw_action_steer = raw_action_throttle = raw_action_brake = None
+
+        # If any modality requests raw_action, compute it once and cache.
+        _uses_raw_action = (
+            self.config_closed_loop.steer_modality == "raw_action"
+            or self.config_closed_loop.throttle_modality == "raw_action"
+            or self.config_closed_loop.brake_modality == "raw_action"
+        )
+        if _uses_raw_action:
+            if (
+                open_loop_prediction.pred_action_beta_alpha is None
+                or open_loop_prediction.pred_action_beta_beta is None
+            ):
+                raise ValueError(
+                    "raw_action modality requires a model trained with use_raw_action=True "
+                    "(predict_beta_action must be enabled)."
+                )
+            raw_action_steer, raw_action_throttle, raw_action_brake = (
+                self.execute_raw_action(
+                    open_loop_prediction.pred_action_beta_alpha,
+                    open_loop_prediction.pred_action_beta_beta,
+                )
+            )
 
         if open_loop_prediction.pred_route is not None:
             route_steer, target_speed_throttle, target_speed_brake = (
@@ -232,6 +305,8 @@ class ClosedLoopInference(OpenLoopInference):
             steer = route_steer
         elif self.config_closed_loop.steer_modality == "waypoint":
             steer = waypoints_steer
+        elif self.config_closed_loop.steer_modality == "raw_action":
+            steer = raw_action_steer
         else:
             raise ValueError(
                 f"Invalid steer_modality: {self.config_closed_loop.steer_modality}",
@@ -241,6 +316,8 @@ class ClosedLoopInference(OpenLoopInference):
             throttle = target_speed_throttle
         elif self.config_closed_loop.throttle_modality == "waypoint":
             throttle = waypoints_throttle
+        elif self.config_closed_loop.throttle_modality == "raw_action":
+            throttle = raw_action_throttle
         else:
             raise ValueError(
                 f"Invalid throttle_modality: {self.config_closed_loop.throttle_modality}",
@@ -250,6 +327,8 @@ class ClosedLoopInference(OpenLoopInference):
             brake = target_speed_brake
         elif self.config_closed_loop.brake_modality == "waypoint":
             brake = waypoints_brake
+        elif self.config_closed_loop.brake_modality == "raw_action":
+            brake = raw_action_brake
         else:
             raise ValueError(
                 f"Invalid brake_modality: {self.config_closed_loop.brake_modality}",
@@ -275,4 +354,7 @@ class ClosedLoopInference(OpenLoopInference):
             route_steer=route_steer,
             target_speed_throttle=target_speed_throttle,
             target_speed_brake=target_speed_brake,
+            raw_action_steer=raw_action_steer,
+            raw_action_throttle=raw_action_throttle,
+            raw_action_brake=raw_action_brake,
         )

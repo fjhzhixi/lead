@@ -115,6 +115,8 @@ class OpenLoopInference:
         jt.Float[torch.Tensor, " 1 1"] | None,
         jt.Float[torch.Tensor, "1 num_speed_classes"] | None,
         jt.Float[torch.Tensor, "1 num_waypoints"] | None,
+        jt.Float[torch.Tensor, "1 2"] | None,
+        jt.Float[torch.Tensor, "1 2"] | None,
     ]:
         """Ensemble the outputs of the planning decoder from multiple models.
 
@@ -128,7 +130,7 @@ class OpenLoopInference:
         """
         pred_routes = pred_future_waypoints = pred_target_speed_scalar = (
             pred_target_speed_distribution
-        ) = pred_future_headings = None
+        ) = pred_future_headings = pred_action_beta_alpha = pred_action_beta_beta = None
 
         if self.config_training.use_planning_decoder:
             if self.config_training.predict_target_speed:
@@ -175,12 +177,22 @@ class OpenLoopInference:
                     [pred.pred_headings[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average headings.
 
+            if self.config_training.predict_beta_action:
+                pred_action_beta_alpha = torch.stack(
+                    [pred.pred_action_beta_alpha[0] for pred in predictions],
+                ).mean(dim=0, keepdim=True)  # Average Beta alpha params.
+                pred_action_beta_beta = torch.stack(
+                    [pred.pred_action_beta_beta[0] for pred in predictions],
+                ).mean(dim=0, keepdim=True)  # Average Beta beta params.
+
         return (
             pred_routes,
             pred_future_waypoints,
             pred_target_speed_scalar,
             pred_target_speed_distribution,
             pred_future_headings,
+            pred_action_beta_alpha,
+            pred_action_beta_beta,
         )
 
     @beartype
@@ -369,6 +381,8 @@ class OpenLoopInference:
             pred_target_speed_scalar,
             pred_target_speed_distribution,
             pred_future_headings,
+            pred_action_beta_alpha,
+            pred_action_beta_beta,
         ) = self.ensemble_planning_decoder(predictions)
 
         return OpenLoopPrediction(
@@ -383,6 +397,8 @@ class OpenLoopInference:
             pred_bounding_box_vehicle_system=pred_bounding_boxes_vehicle_system,
             pred_bounding_box_image_system=pred_bounding_boxes_image_system,
             pred_radar_predictions=None,
+            pred_action_beta_alpha=pred_action_beta_alpha,
+            pred_action_beta_beta=pred_action_beta_beta,
         )
 
     @beartype
@@ -430,3 +446,5 @@ class OpenLoopPrediction:
     pred_bounding_box_vehicle_system: list[PredictedBoundingBox] | None
     pred_bounding_box_image_system: list[PredictedBoundingBox] | None
     pred_radar_predictions: None
+    pred_action_beta_alpha: jt.Float[torch.Tensor, "bs 2"] | None
+    pred_action_beta_beta: jt.Float[torch.Tensor, "bs 2"] | None
