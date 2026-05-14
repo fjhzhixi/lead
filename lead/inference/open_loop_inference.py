@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 import jaxtyping as jt
@@ -22,6 +23,38 @@ from lead.training.config_training import TrainingConfig
 np.set_printoptions(suppress=True)
 
 LOG = logging.getLogger(__name__)
+
+
+def _resolve_model_weight_paths(model_path: str, prefix: str) -> list[str]:
+    checkpoint_list = os.environ.get("CHECKPOINT_LIST", "").strip()
+    if not checkpoint_list:
+        return [
+            os.path.join(model_path, file)
+            for file in sorted(os.listdir(model_path))
+            if file.startswith(prefix) and file.endswith(".pth")
+        ]
+
+    checkpoint_files = [
+        checkpoint
+        for checkpoint in re.split(r"[\s,]+", checkpoint_list)
+        if checkpoint
+    ]
+    if not checkpoint_files:
+        raise ValueError("CHECKPOINT_LIST is set but does not contain any checkpoints.")
+
+    checkpoint_paths = []
+    for checkpoint_file in checkpoint_files:
+        checkpoint_path = checkpoint_file
+        if not os.path.isabs(checkpoint_path) and not os.path.isfile(checkpoint_path):
+            checkpoint_path = os.path.join(model_path, checkpoint_path)
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                f"Checkpoint from CHECKPOINT_LIST does not exist: {checkpoint_path}",
+            )
+        checkpoint_paths.append(checkpoint_path)
+
+    LOG.info("Using CHECKPOINT_LIST with %d checkpoint(s).", len(checkpoint_paths))
+    return checkpoint_paths
 
 
 class OpenLoopInference:
@@ -50,23 +83,26 @@ class OpenLoopInference:
 
         # Loading models
         self.nets: list[TFv6] = []
-        for file in sorted(os.listdir(model_path)):
-            if file.startswith(prefix) and file.endswith(".pth"):
-                LOG.info(f"Loading model weight from {os.path.join(model_path, file)}")
-                net = TFv6(self.device, self.config_training)
-                if self.config_training.sync_batchnorm:
-                    net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
-                state_dict = torch.load(
-                    os.path.join(model_path, file),
-                    map_location=self.device,
-                    weights_only=True,
-                )
-                net.load_state_dict(
-                    state_dict,
-                    strict=config_open_loop.strict_weight_load,
-                )
-                net.cuda(device=self.device).eval()
-                self.nets.append(net)
+        for model_weight_path in _resolve_model_weight_paths(model_path, prefix):
+            LOG.info(f"Loading model weight from {model_weight_path}")
+            net = TFv6(self.device, self.config_training)
+            if self.config_training.sync_batchnorm:
+                net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
+            state_dict = torch.load(
+                model_weight_path,
+                map_location=self.device,
+                weights_only=True,
+            )
+            net.load_state_dict(
+                state_dict,
+                strict=config_open_loop.strict_weight_load,
+            )
+            net.cuda(device=self.device).eval()
+            self.nets.append(net)
+        if not self.nets:
+            raise FileNotFoundError(
+                f"No model weights found in {model_path} with prefix '{prefix}'.",
+            )
         self.step = 4  # Constant so produced images start with 5, not really important
 
     @beartype
