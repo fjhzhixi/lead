@@ -130,6 +130,43 @@ class BetaDistribution(nn.Module):
       return self.sample()
 
 
+def compute_bc_kl_smooth_loss(
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    action_label_01: torch.Tensor,
+    target_concentration: float,
+    mean_loss_coef: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """KL-from-smooth-target Beta action loss.
+
+    Constructs a smooth Beta distribution centred on the expert action and
+    minimises KL(target || pred) plus an auxiliary mean-MAE term.
+
+    Args:
+        alpha: Predicted Beta alpha parameters, shape [B, 2], fp32.
+        beta: Predicted Beta beta parameters, shape [B, 2], fp32.
+        action_label_01: Expert action in [0, 1] (already clamped), shape [B, 2].
+        target_concentration: Concentration for the smooth expert distribution.
+            Higher values create a sharper peak around the expert action.
+        mean_loss_coef: Weight of the mean MAE auxiliary term.
+
+    Returns:
+        total_loss: Scalar loss tensor.
+        kl_per_dim: Per-sample per-dim KL, shape [B, 2].
+        mean_err_per_dim: Per-sample per-dim mean absolute error, shape [B, 2].
+    """
+    alpha_e = 1.0 + action_label_01 * target_concentration
+    beta_e = 1.0 + (1.0 - action_label_01) * target_concentration
+    target_dist = Beta(alpha_e, beta_e)
+    pred_dist = Beta(alpha, beta)
+    kl_per_dim = torch.distributions.kl_divergence(target_dist, pred_dist)  # [B, 2]
+    kl_loss = kl_per_dim.sum(dim=-1).mean()
+    pred_mean = alpha / (alpha + beta)
+    mean_err_per_dim = (pred_mean - action_label_01).abs()  # [B, 2]
+    mean_loss = mean_err_per_dim.mean()
+    return kl_loss + mean_loss_coef * mean_loss, kl_per_dim, mean_err_per_dim
+
+
 class PlanningDecoder(nn.Module):
     @beartype
     def __init__(
@@ -423,29 +460,58 @@ class PlanningDecoder(nn.Module):
                     beta_label_eps,
                     1.0 - beta_label_eps,
                 )
-                self.action_dist.proba_distribution(
-                    predictions.pred_action_beta_alpha.float(),
-                    predictions.pred_action_beta_beta.float(),
-                )
-                # Per-dim log_prob/entropy: [B, 2] where dim 0 = steer, dim 1 = thr_brake
-                log_prob_per_dim = self.action_dist.distribution.log_prob(
-                    action_label_scaled
-                )  # [B, 2]
-                entropy_per_dim = self.action_dist.distribution.entropy()  # [B, 2]
-                log_prob = log_prob_per_dim.sum(dim=-1).mean()
-                entropy = entropy_per_dim.sum(dim=-1).mean()
-                loss["loss_bc_action"] = (
-                    -log_prob
-                    - self.config.beta_action_entropy_coef * entropy
-                )
-                log.update(
-                    {
-                        "loss/bc_nll_steer": -log_prob_per_dim[:, 0].mean().item(),
-                        "loss/bc_nll_thr_brake": -log_prob_per_dim[:, 1].mean().item(),
-                        "loss/bc_entropy_steer": entropy_per_dim[:, 0].mean().item(),
-                        "loss/bc_entropy_thr_brake": entropy_per_dim[:, 1].mean().item(),
-                    }
-                )
+                pred_alpha = predictions.pred_action_beta_alpha.float()
+                pred_beta = predictions.pred_action_beta_beta.float()
+                self.action_dist.proba_distribution(pred_alpha, pred_beta)
+
+                if self.config.raw_action_loss_type == "nll":
+                    # Per-dim log_prob/entropy: [B, 2] where dim 0 = steer, dim 1 = thr_brake
+                    log_prob_per_dim = self.action_dist.distribution.log_prob(
+                        action_label_scaled
+                    )  # [B, 2]
+                    entropy_per_dim = self.action_dist.distribution.entropy()  # [B, 2]
+                    log_prob = log_prob_per_dim.sum(dim=-1).mean()
+                    entropy = entropy_per_dim.sum(dim=-1).mean()
+                    loss["loss_bc_action"] = (
+                        -log_prob
+                        - self.config.beta_action_entropy_coef * entropy
+                    )
+                    log.update(
+                        {
+                            "loss/bc_nll_steer": -log_prob_per_dim[:, 0].mean().item(),
+                            "loss/bc_nll_thr_brake": -log_prob_per_dim[
+                                :, 1
+                            ].mean().item(),
+                            "loss/bc_entropy_steer": entropy_per_dim[
+                                :, 0
+                            ].mean().item(),
+                            "loss/bc_entropy_thr_brake": entropy_per_dim[
+                                :, 1
+                            ].mean().item(),
+                        }
+                    )
+                elif self.config.raw_action_loss_type == "kl_smooth":
+                    total, kl_per_dim, mean_err = compute_bc_kl_smooth_loss(
+                        alpha=pred_alpha,
+                        beta=pred_beta,
+                        action_label_01=action_label_scaled,
+                        target_concentration=self.config.beta_action_kl_target_concentration,
+                        mean_loss_coef=self.config.beta_action_kl_mean_loss_coef,
+                    )
+                    loss["loss_bc_action"] = total
+                    log.update(
+                        {
+                            "loss/bc_kl_steer": kl_per_dim[:, 0].mean().item(),
+                            "loss/bc_kl_thr_brake": kl_per_dim[:, 1].mean().item(),
+                            "loss/bc_mae_steer": mean_err[:, 0].mean().item(),
+                            "loss/bc_mae_thr_brake": mean_err[:, 1].mean().item(),
+                        }
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown raw_action_loss_type: {self.config.raw_action_loss_type!r}. "
+                        "Expected 'nll' or 'kl_smooth'."
+                    )
 
         if (
             "iteration" in data

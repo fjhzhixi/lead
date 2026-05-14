@@ -751,6 +751,19 @@ class TrainingConfig(BaseConfig):
     # Minimum concentration parameter value for the Beta distribution (keeps alpha/beta > 0).
     beta_action_min_concentration = 1.0
 
+    # Loss type for the Beta action head.
+    # Options:
+    #   "nll"       — negative log-likelihood + entropy regularization (original).
+    #   "kl_smooth" — KL(smooth_expert_Beta || pred_Beta) + MAE auxiliary term.
+    raw_action_loss_type = "nll"
+
+    # Target concentration for the smooth expert Beta distribution in "kl_smooth" mode.
+    # Higher values create a sharper peak around the expert action.
+    beta_action_kl_target_concentration = 20.0
+
+    # Weight of the mean MAE auxiliary term in "kl_smooth" mode.
+    beta_action_kl_mean_loss_coef = 0.1
+
     @property
     def target_speed_classes(self):
         """Carla target speed prediction classes in m/s."""
