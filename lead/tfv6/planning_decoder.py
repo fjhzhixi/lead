@@ -156,8 +156,10 @@ class PlanningDecoder(nn.Module):
         if self.config.predict_target_speed:
             num_queries += 1
         if self.config.predict_beta_action:
-            # Raw action mode uses separate queries for alpha and beta of the Beta distribution.
-            num_queries += 2
+            # One shared query token; alpha and beta are predicted by two separate linear heads
+            # applied to the same query feature. Using two separate tokens causes them to converge
+            # to identical representations (no loss forces them apart), yielding constant outputs.
+            num_queries += 1
 
         self.query = nn.Parameter(
             torch.zeros(
@@ -302,18 +304,18 @@ class PlanningDecoder(nn.Module):
             query_idx += 1
 
         if self.config.predict_beta_action:
-            action_alpha_query = queries[:, query_idx]
-            action_beta_query = queries[:, query_idx + 1]
-            # Apply softplus + min_concentration to ensure alpha, beta > 1.0
+            action_query = queries[:, query_idx]
+            # Both heads share the same query feature; two separate linear projections
+            # ensure alpha and beta are independently predicted from the same context.
             action_beta_alpha = (
-                F.softplus(self.action_beta_alpha_net(action_alpha_query))
+                F.softplus(self.action_beta_alpha_net(action_query))
                 + self.config.beta_action_min_concentration
             )
             action_beta_beta = (
-                F.softplus(self.action_beta_beta_net(action_beta_query))
+                F.softplus(self.action_beta_beta_net(action_query))
                 + self.config.beta_action_min_concentration
             )
-            query_idx += 2
+            query_idx += 1
 
         return (
             route,

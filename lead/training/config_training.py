@@ -721,7 +721,7 @@ class TrainingConfig(BaseConfig):
     @property
     def predict_spatial_path(self):
         """If true predict spatial path."""
-        return self.use_waypoints_action and self.carla_leaderboard_mode
+        return (self.use_waypoints_action or self.use_raw_action) and self.carla_leaderboard_mode
 
     @property
     def predict_temporal_spatial_waypoints(self):
