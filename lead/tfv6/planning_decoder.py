@@ -427,17 +427,24 @@ class PlanningDecoder(nn.Module):
                     predictions.pred_action_beta_alpha.float(),
                     predictions.pred_action_beta_beta.float(),
                 )
-                log_prob = (
-                    self.action_dist.distribution.log_prob(action_label_scaled)
-                    .sum(dim=-1)
-                    .mean()
-                )
-                entropy = (
-                    self.action_dist.distribution.entropy().sum(dim=-1).mean()
-                )
+                # Per-dim log_prob/entropy: [B, 2] where dim 0 = steer, dim 1 = thr_brake
+                log_prob_per_dim = self.action_dist.distribution.log_prob(
+                    action_label_scaled
+                )  # [B, 2]
+                entropy_per_dim = self.action_dist.distribution.entropy()  # [B, 2]
+                log_prob = log_prob_per_dim.sum(dim=-1).mean()
+                entropy = entropy_per_dim.sum(dim=-1).mean()
                 loss["loss_bc_action"] = (
                     -log_prob
-                    -self.config.beta_action_entropy_coef * entropy
+                    - self.config.beta_action_entropy_coef * entropy
+                )
+                log.update(
+                    {
+                        "loss/bc_nll_steer": -log_prob_per_dim[:, 0].mean().item(),
+                        "loss/bc_nll_thr_brake": -log_prob_per_dim[:, 1].mean().item(),
+                        "loss/bc_entropy_steer": entropy_per_dim[:, 0].mean().item(),
+                        "loss/bc_entropy_thr_brake": entropy_per_dim[:, 1].mean().item(),
+                    }
                 )
 
         if (
@@ -531,6 +538,47 @@ class PlanningDecoder(nn.Module):
                         predictions.pred_headings,
                         heading_label,
                     )
+
+            if self.config.predict_beta_action:
+                steer_label = data["steer"].to(
+                    self.device, dtype=torch.float32, non_blocking=True
+                )
+                throttle_label = data["throttle"].to(
+                    self.device, dtype=torch.float32, non_blocking=True
+                )
+                brake_float_label = data["brake"].to(
+                    self.device, dtype=torch.float32, non_blocking=True
+                )
+                action_label = torch.clamp(
+                    torch.stack(
+                        [steer_label, throttle_label - brake_float_label], dim=-1
+                    ).float(),
+                    -1.0,
+                    1.0,
+                )
+                pred_mean = self.action_dist.evaluate_mean().float() * 2.0 - 1.0
+                mae_per_dim = torch.abs(pred_mean - action_label).mean(dim=0)  # [2]
+                entropy_per_dim_m = (
+                    self.action_dist.distribution.entropy().mean(dim=0)
+                )  # [2]
+                conc = (
+                    predictions.pred_action_beta_alpha
+                    + predictions.pred_action_beta_beta
+                ).float()  # [B, 2]
+                log.update(
+                    {
+                        "metric/action_mae_steer": mae_per_dim[0].item(),
+                        "metric/action_mae_thr_brake": mae_per_dim[1].item(),
+                        "metric/entropy_mean_steer": entropy_per_dim_m[0].item(),
+                        "metric/entropy_mean_thr_brake": entropy_per_dim_m[1].item(),
+                        "metric/concentration_p95_steer": torch.quantile(
+                            conc[:, 0], 0.95
+                        ).item(),
+                        "metric/concentration_p95_thr_brake": torch.quantile(
+                            conc[:, 1], 0.95
+                        ).item(),
+                    }
+                )
 
 
 @beartype
