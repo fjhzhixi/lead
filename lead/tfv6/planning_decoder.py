@@ -240,9 +240,21 @@ class PlanningDecoder(nn.Module):
         # Beta action head for IL/BC training: predicts Beta distribution over [steer, throttle_brake]
         if self.config.predict_beta_action:
             self.action_dist = BetaDistribution(action_dim=2)
-            self.action_beta_alpha_net, self.action_beta_beta_net = (
-                self.action_dist.proba_distribution_net(config.transfuser_token_dim)
-            )
+            if self.config.raw_action_pred_type == "alpha_beta":
+                self.action_beta_alpha_net, self.action_beta_beta_net = (
+                    self.action_dist.proba_distribution_net(config.transfuser_token_dim)
+                )
+            elif self.config.raw_action_pred_type == "mu_kappa":
+                # mu_net  → sigmoid → mean ∈ (0, 1)
+                # kappa_net → softplus → concentration > 0
+                # Decouples distribution center from spread for cleaner gradients.
+                self.action_mu_net = nn.Linear(config.transfuser_token_dim, 2)
+                self.action_kappa_net = nn.Linear(config.transfuser_token_dim, 2)
+            else:
+                raise ValueError(
+                    f"Unknown raw_action_pred_type: {self.config.raw_action_pred_type!r}. "
+                    "Expected 'alpha_beta' or 'mu_kappa'."
+                )
 
         self.tp_normalization_constants = torch.tensor(
             self.config.target_points_normalization_constants,
@@ -342,16 +354,25 @@ class PlanningDecoder(nn.Module):
 
         if self.config.predict_beta_action:
             action_query = queries[:, query_idx]
-            # Both heads share the same query feature; two separate linear projections
-            # ensure alpha and beta are independently predicted from the same context.
-            action_beta_alpha = (
-                F.softplus(self.action_beta_alpha_net(action_query))
-                + self.config.beta_action_min_concentration
-            )
-            action_beta_beta = (
-                F.softplus(self.action_beta_beta_net(action_query))
-                + self.config.beta_action_min_concentration
-            )
+            if self.config.raw_action_pred_type == "alpha_beta":
+                # Both heads share the same query feature; two separate linear projections
+                # ensure alpha and beta are independently predicted from the same context.
+                action_beta_alpha = (
+                    F.softplus(self.action_beta_alpha_net(action_query))
+                    + self.config.beta_action_min_concentration
+                )
+                action_beta_beta = (
+                    F.softplus(self.action_beta_beta_net(action_query))
+                    + self.config.beta_action_min_concentration
+                )
+            else:  # mu_kappa
+                # mu controls the center, kappa controls the concentration.
+                # alpha = 1 + mu * kappa,  beta = 1 + (1 - mu) * kappa
+                # Both are >= 1 by construction, no min_concentration needed.
+                mu = torch.sigmoid(self.action_mu_net(action_query))     # (0, 1)
+                kappa = F.softplus(self.action_kappa_net(action_query))  # > 0
+                action_beta_alpha = 1.0 + mu * kappa
+                action_beta_beta = 1.0 + (1.0 - mu) * kappa
             query_idx += 1
 
         return (

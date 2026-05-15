@@ -751,6 +751,14 @@ class TrainingConfig(BaseConfig):
     # Minimum concentration parameter value for the Beta distribution (keeps alpha/beta > 0).
     beta_action_min_concentration = 1.0
 
+    # Parameterization of the Beta action prediction head.
+    # Options:
+    #   "alpha_beta" — network directly outputs alpha and beta via softplus.
+    #   "mu_kappa"   — network outputs mu (mean in (0,1)) and kappa (concentration > 0);
+    #                   alpha = 1 + mu * kappa,  beta = 1 + (1 - mu) * kappa.
+    #                   Decouples location from spread, giving cleaner gradients.
+    raw_action_pred_type = "alpha_beta"
+
     # Loss type for the Beta action head.
     # Options:
     #   "nll"       — negative log-likelihood + entropy regularization (original).
