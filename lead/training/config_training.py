@@ -765,6 +765,18 @@ class TrainingConfig(BaseConfig):
     #   "kl_smooth" — KL(smooth_expert_Beta || pred_Beta) + MAE auxiliary term.
     raw_action_loss_type = "nll"
 
+    # Source for raw action labels.
+    # Options:
+    #   "log"       — use expert logged control fields: steer/throttle/brake.
+    #   "waypoints" — derive analytic labels from GT future_waypoints.
+    raw_action_src = "log"
+
+    # Normalisation speed (m/s) used when raw_action_src='waypoints'.
+    # The longitudinal label becomes clip((v_desired - v_current) / accel_norm_speed, -1, 1),
+    # replacing the bang-bang throttle/brake pair with a smooth signed acceleration
+    # that is well-spread across [-1, 1] and avoids boundary saturation in the Beta loss.
+    accel_norm_speed = 10.0
+
     # Target concentration for the smooth expert Beta distribution in "kl_smooth" mode.
     # Higher values create a sharper peak around the expert action.
     beta_action_kl_target_concentration = 20.0

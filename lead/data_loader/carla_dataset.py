@@ -38,6 +38,98 @@ from lead.training.config_training import TrainingConfig
 LOG = logging.getLogger(__name__)
 
 
+def compute_action_labels_from_future_waypoints(
+    future_waypoints: npt.NDArray,
+    current_speed: float,
+    waypoint_dt: float,
+    *,
+    brake_speed: float = 0.4,
+    brake_ratio: float = 1.1,
+    speed_delta_clip: float = 0.99,
+    steer_kp: float = 3.118357247806046,
+    throttle_kp: float = 1.75,
+    smooth_accel_norm: float | None = None,
+) -> npt.NDArray:
+    """Convert GT future waypoints into per-step analytic action labels.
+
+    This is a stateless approximation of the waypoint controller used in
+    closed-loop inference. It returns one action label for each future waypoint
+    so callers can choose the horizon they want to supervise.
+
+    Args:
+        future_waypoints: Future ego-frame waypoints, shape (T, 2), in meters.
+        current_speed: Current ego speed in m/s.
+        waypoint_dt: Time between consecutive future waypoints in seconds.
+        brake_speed: Desired speed below which braking is active.
+        brake_ratio: Current/desired speed ratio above which braking is active.
+        speed_delta_clip: Maximum positive speed error used for throttle.
+        steer_kp: Proportional gain from normalized heading error to steer.
+        throttle_kp: Proportional gain from speed error to throttle.
+        smooth_accel_norm: When set, replaces the bang-bang throttle/brake pair
+            (columns 1 and 2) with a smooth signed acceleration label.
+            The label is clip((v_desired - v_current) / smooth_accel_norm, -1, 1)
+            stored in column 1; column 2 is set to 0. This avoids the heavy
+            boundary saturation that occurs with the binary brake signal.
+
+    Returns:
+        Per-step actions with columns [steer, throttle_or_accel, brake], shape (T, 3).
+        When smooth_accel_norm is set: [steer, smooth_accel, 0], where
+        smooth_accel ∈ [-1, 1] encodes signed desired speed change.
+    """
+    if waypoint_dt <= 0.0:
+        raise ValueError(f"waypoint_dt must be positive, got {waypoint_dt}")
+
+    waypoints = np.asarray(future_waypoints, dtype=np.float32).reshape(-1, 2)
+    actions = np.zeros((waypoints.shape[0], 3), dtype=np.float32)
+    previous_waypoint = np.zeros(2, dtype=np.float32)
+    step_current_speed = float(current_speed)
+    eps = 1e-6
+
+    for index, waypoint in enumerate(waypoints):
+        segment_distance = float(np.linalg.norm(waypoint - previous_waypoint))
+        desired_speed = segment_distance / waypoint_dt
+
+        if smooth_accel_norm is not None:
+            # Smooth signed acceleration label: avoids bang-bang saturation.
+            smooth_accel = float(
+                np.clip(
+                    (desired_speed - step_current_speed) / smooth_accel_norm,
+                    -1.0,
+                    1.0,
+                )
+            )
+            heading_error = np.degrees(np.arctan2(waypoint[1], waypoint[0])) / 90.0
+            if step_current_speed < 0.01 and smooth_accel <= 0.0:
+                heading_error = 0.0
+            steer = float(np.clip(steer_kp * heading_error, -1.0, 1.0))
+            actions[index] = (steer, smooth_accel, 0.0)
+        else:
+            brake = desired_speed < brake_speed
+            if desired_speed > eps:
+                brake = brake or (step_current_speed / desired_speed) > brake_ratio
+
+            delta_speed = np.clip(
+                desired_speed - step_current_speed,
+                0.0,
+                speed_delta_clip,
+            )
+            throttle = np.clip(throttle_kp * delta_speed, 0.0, 1.0)
+            if brake:
+                throttle = 0.0
+
+            heading_error = np.degrees(np.arctan2(waypoint[1], waypoint[0])) / 90.0
+            if step_current_speed < 0.01 or brake:
+                heading_error = 0.0
+            steer = np.clip(steer_kp * heading_error, -1.0, 1.0)
+
+            actions[index] = (steer, throttle, float(brake))
+
+        previous_waypoint = waypoint
+        step_current_speed = desired_speed
+
+    return actions
+
+
 class CARLAData(Dataset):
     @beartype
     def __init__(
@@ -518,6 +610,16 @@ class CARLAData(Dataset):
                 data["future_yaws"] = carla_dataset_utils.perturbate_yaws(
                     future_yaws,
                     yaw_perturbation=perturbation_rotation,
+                )
+                data["future_actions"] = compute_action_labels_from_future_waypoints(
+                    data["future_waypoints"],
+                    current_speed=float(meta["speed"]),
+                    waypoint_dt=self.config.waypoints_spacing / self.config.carla_fps,
+                    smooth_accel_norm=(
+                        self.config.accel_norm_speed
+                        if self.config.raw_action_src == "waypoints"
+                        else None
+                    ),
                 )
 
         # Route and target speed features

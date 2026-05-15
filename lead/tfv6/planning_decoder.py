@@ -267,6 +267,52 @@ class PlanningDecoder(nn.Module):
     def reset_parameters(self):
         nn.init.uniform_(self.query)
 
+    def _get_raw_action_label_components(
+        self,
+        data: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (steer_label, acc_label) according to config.raw_action_src.
+
+        For ``raw_action_src='log'``, acc_label = throttle - brake.
+        For ``raw_action_src='waypoints'``, acc_label is the smooth signed
+        acceleration already stored in future_actions[:, 1].
+        """
+        if self.config.raw_action_src == "waypoints":
+            if "future_actions" not in data:
+                raise KeyError(
+                    "raw_action_src='waypoints' requires data['future_actions']. "
+                    "Ensure CARLAData is producing waypoint-derived action labels.",
+                )
+            future_action_label = data["future_actions"].to(
+                self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )[:, 0]
+            return future_action_label[:, 0], future_action_label[:, 1]
+
+        if self.config.raw_action_src == "log":
+            steer = data["steer"].to(
+                self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            throttle = data["throttle"].to(
+                self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            brake = data["brake"].to(
+                self.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            return steer, throttle - brake
+
+        raise ValueError(
+            f"Unknown raw_action_src: {self.config.raw_action_src!r}. "
+            "Expected 'log' or 'waypoints'.",
+        )
+
     @beartype
     def forward(
         self,
@@ -452,25 +498,13 @@ class PlanningDecoder(nn.Module):
                 )  # FDE
 
             if self.config.predict_beta_action:
-                # Expert action label: [steer, throttle - brake] in [-1, 1]
-                steer_label = data["steer"].to(
-                    self.device,
-                    dtype=torch.float32,
-                    non_blocking=True,
+                # Action label: [steer, acc] in [-1, 1].
+                # raw_action_src selects expert log labels (acc = throttle - brake)
+                # or analytic smooth-accel labels from GT future_waypoints.
+                steer_label, acc_label = (
+                    self._get_raw_action_label_components(data)
                 )
-                throttle_label = data["throttle"].to(
-                    self.device,
-                    dtype=torch.float32,
-                    non_blocking=True,
-                )
-                brake_float_label = data["brake"].to(
-                    self.device,
-                    dtype=torch.float32,
-                    non_blocking=True,
-                )
-                action_label = torch.stack(
-                    [steer_label, throttle_label - brake_float_label], dim=-1
-                )
+                action_label = torch.stack([steer_label, acc_label], dim=-1)
                 # Keep labels strictly inside the open Beta support. This must stay
                 # in fp32: in bf16, 1 - 1e-6 rounds back to 1.0 and produces
                 # infinite gradients at the distribution boundary.
@@ -627,19 +661,11 @@ class PlanningDecoder(nn.Module):
                     )
 
             if self.config.predict_beta_action:
-                steer_label = data["steer"].to(
-                    self.device, dtype=torch.float32, non_blocking=True
-                )
-                throttle_label = data["throttle"].to(
-                    self.device, dtype=torch.float32, non_blocking=True
-                )
-                brake_float_label = data["brake"].to(
-                    self.device, dtype=torch.float32, non_blocking=True
+                steer_label, acc_label = (
+                    self._get_raw_action_label_components(data)
                 )
                 action_label = torch.clamp(
-                    torch.stack(
-                        [steer_label, throttle_label - brake_float_label], dim=-1
-                    ).float(),
+                    torch.stack([steer_label, acc_label], dim=-1).float(),
                     -1.0,
                     1.0,
                 )

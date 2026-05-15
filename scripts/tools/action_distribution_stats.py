@@ -10,6 +10,14 @@ is also available for quick data inspection.
   - throttle
   - brake
   - thr_brake = throttle - float(brake)
+
+Two label sources are supported via ``--raw-action-src``:
+  ``log``       — read ``steer``/``throttle``/``brake`` directly from the meta file
+                  (expert logged control). Default.
+  ``waypoints`` — derive analytic labels from ``future_positions`` + ``speed`` stored
+                  in the meta file, mirroring the ``raw_action_src='waypoints'``
+                  training path in CARLAData. Only the first predicted step is used as
+                  the label.
 """
 
 import argparse
@@ -31,6 +39,59 @@ ACTION_RANGES = {
     "brake": (0.0, 1.0),
     "thr_brake": (-1.0, 1.0),
 }
+
+_DEFAULT_WAYPOINTS_SPACING = 5  # frames between predicted waypoints (CARLA leaderboard)
+_DEFAULT_CARLA_FPS = 20  # simulator frames per second
+
+
+def _compute_action_from_waypoints(
+    future_positions: list,
+    current_speed: float,
+    waypoints_spacing: int,
+    carla_fps: int,
+    accel_norm_speed: float = 10.0,
+) -> tuple[float, float, float] | None:
+    """Derive smooth accel action for the first future step from meta data.
+
+    Samples ``future_positions[waypoints_spacing]`` from the raw meta list,
+    then delegates to ``compute_action_labels_from_future_waypoints`` (from
+    ``lead.data_loader.carla_dataset``) with ``smooth_accel_norm`` set so that
+    the result is identical to the training label when ``raw_action_src='waypoints'``.
+
+    Returns:
+        (steer, smooth_accel, 0.0) for the first predicted waypoint step, or
+        ``None`` if the data are missing/invalid.
+    """
+    if future_positions is None or len(future_positions) == 0:
+        return None
+    if waypoints_spacing < 1 or carla_fps < 1:
+        return None
+
+    waypoint_dt = waypoints_spacing / carla_fps  # seconds between steps
+    # Mirror CARLAData: sample positions at [spacing, 2*spacing, ...]
+    sampled = [
+        future_positions[i][:2]
+        for i in [waypoints_spacing]
+        if i < len(future_positions)
+    ]
+    if not sampled:
+        return None
+
+    # Delegate to the canonical implementation in carla_dataset.
+    # Import is lazy so it only triggers when --raw-action-src=waypoints is used,
+    # keeping the script lightweight for log-mode / pure numpy usage.
+    from lead.data_loader.carla_dataset import (
+        compute_action_labels_from_future_waypoints,
+    )
+
+    actions = compute_action_labels_from_future_waypoints(
+        np.asarray(sampled, dtype=np.float32),
+        current_speed=current_speed,
+        waypoint_dt=waypoint_dt,
+        smooth_accel_norm=accel_norm_speed,
+    )
+    # actions shape: (1, 3) — [steer, smooth_accel, 0.0]
+    return float(actions[0, 0]), float(actions[0, 1]), float(actions[0, 2])
 
 
 def find_meta_files_by_scan(root: Path) -> list[Path]:
@@ -154,7 +215,14 @@ def summarize_values(values: list[float], value_range: tuple[float, float], bins
     }
 
 
-def load_action_values(meta_files: list[Path], max_files: int | None) -> tuple[dict[str, list[float]], dict[str, int]]:
+def load_action_values(
+    meta_files: list[Path],
+    max_files: int | None,
+    raw_action_src: str = "log",
+    waypoints_spacing: int = _DEFAULT_WAYPOINTS_SPACING,
+    carla_fps: int = _DEFAULT_CARLA_FPS,
+    accel_norm_speed: float = 10.0,
+) -> tuple[dict[str, list[float]], dict[str, int]]:
     values = {key: [] for key in ACTION_RANGES}
     counters = {
         "files_seen": 0,
@@ -172,12 +240,29 @@ def load_action_values(meta_files: list[Path], max_files: int | None) -> tuple[d
             counters["files_failed"] += 1
             continue
 
-        steer = as_finite_float(meta.get("steer"))
-        throttle = as_finite_float(meta.get("throttle"))
-        brake = as_finite_float(meta.get("brake"))
-        if steer is None or throttle is None or brake is None:
-            counters["missing_or_invalid_action"] += 1
-            continue
+        if raw_action_src == "waypoints":
+            speed_val = as_finite_float(meta.get("speed"))
+            if speed_val is None:
+                counters["missing_or_invalid_action"] += 1
+                continue
+            result = _compute_action_from_waypoints(
+                meta.get("future_positions"),
+                current_speed=speed_val,
+                waypoints_spacing=waypoints_spacing,
+                carla_fps=carla_fps,
+                accel_norm_speed=accel_norm_speed,
+            )
+            if result is None:
+                counters["missing_or_invalid_action"] += 1
+                continue
+            steer, throttle, brake = result
+        else:  # raw_action_src == "log"
+            steer = as_finite_float(meta.get("steer"))
+            throttle = as_finite_float(meta.get("throttle"))
+            brake = as_finite_float(meta.get("brake"))
+            if steer is None or throttle is None or brake is None:
+                counters["missing_or_invalid_action"] += 1
+                continue
 
         values["steer"].append(steer)
         values["throttle"].append(throttle)
@@ -191,11 +276,20 @@ def load_action_values(meta_files: list[Path], max_files: int | None) -> tuple[d
 def build_summary(args: argparse.Namespace) -> dict:
     root = Path(args.root).expanduser()
     meta_files = find_meta_files(args)
-    values, counters = load_action_values(meta_files, args.max_files)
+    values, counters = load_action_values(
+        meta_files,
+        args.max_files,
+        raw_action_src=args.raw_action_src,
+        waypoints_spacing=args.waypoints_spacing,
+        carla_fps=args.carla_fps,
+        accel_norm_speed=args.accel_norm_speed,
+    )
 
     summary = {
         "root": str(root),
         "source": args.source,
+        "raw_action_src": args.raw_action_src,
+        "accel_norm_speed": args.accel_norm_speed if args.raw_action_src == "waypoints" else None,
         "meta_files_found": len(meta_files),
         **counters,
         "stats": {
@@ -225,6 +319,7 @@ def build_summary(args: argparse.Namespace) -> dict:
 
 def print_text_summary(summary: dict) -> None:
     print(f"root: {summary['root']}")
+    print(f"raw_action_src: {summary.get('raw_action_src', 'log')}")
     print(f"meta_files_found: {summary['meta_files_found']}")
     print(f"files_loaded: {summary['files_loaded']}")
     print(f"files_failed: {summary['files_failed']}")
@@ -345,6 +440,40 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on the number of meta files to scan.",
+    )
+    parser.add_argument(
+        "--raw-action-src",
+        choices=["log", "waypoints"],
+        default="log",
+        help=(
+            "log: read steer/throttle/brake directly from meta files (expert logged control). "
+            "waypoints: derive analytic action labels from future_positions + speed stored in "
+            "the meta file, mirroring raw_action_src='waypoints' in training."
+        ),
+    )
+    parser.add_argument(
+        "--waypoints-spacing",
+        type=int,
+        default=_DEFAULT_WAYPOINTS_SPACING,
+        help=(
+            "Spacing (in frames) between predicted waypoints. Must match config.waypoints_spacing "
+            f"used during data collection (default: {_DEFAULT_WAYPOINTS_SPACING})."
+        ),
+    )
+    parser.add_argument(
+        "--carla-fps",
+        type=int,
+        default=_DEFAULT_CARLA_FPS,
+        help=f"CARLA simulator FPS used during data collection (default: {_DEFAULT_CARLA_FPS}).",
+    )
+    parser.add_argument(
+        "--accel-norm-speed",
+        type=float,
+        default=10.0,
+        help=(
+            "Normalisation speed (m/s) for the smooth accel label when --raw-action-src=waypoints. "
+            "Label = clip((v_desired - v_current) / accel_norm_speed, -1, 1). (default: 10.0)"
+        ),
     )
     parser.add_argument(
         "--json",
