@@ -284,7 +284,7 @@ class ClosedLoopInference(OpenLoopInference):
                 )
             )
 
-        if open_loop_prediction.pred_route is not None:
+        if open_loop_prediction.pred_route is not None and open_loop_prediction.pred_target_speed_scalar is not None:
             route_steer, target_speed_throttle, target_speed_brake = (
                 self.execute_route_and_target_speed(
                     open_loop_prediction.pred_route,
